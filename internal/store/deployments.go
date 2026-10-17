@@ -75,6 +75,8 @@ type CreateDeploymentInput struct {
 	ConfigSnapshotJSON   string
 	ConfigVersion        int
 	PreviousDeploymentID *string
+	// RollbackOfID marks this deployment as a rollback of that one.
+	RollbackOfID *string
 }
 
 // CreateDeployment inserts a pending deployment before the validate step
@@ -92,13 +94,17 @@ func (s *Store) CreateDeployment(ctx context.Context, in CreateDeploymentInput) 
 	if in.PreviousDeploymentID != nil {
 		prev = *in.PreviousDeploymentID
 	}
+	var rollbackOf any
+	if in.RollbackOfID != nil {
+		rollbackOf = *in.RollbackOfID
+	}
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO deployments (id, app_id, seq, job_id, kind, state, image_ref,
 		                         config_snapshot_json, config_version,
-		                         previous_deployment_id, created_at)
-		VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
+		                         previous_deployment_id, rollback_of_id, created_at)
+		VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)`,
 		in.ID, in.AppID, seq, in.JobID, in.Kind, in.ImageRef,
-		in.ConfigSnapshotJSON, in.ConfigVersion, prev, now.UnixMilli())
+		in.ConfigSnapshotJSON, in.ConfigVersion, prev, rollbackOf, now.UnixMilli())
 	if err != nil {
 		return nil, fmt.Errorf("store: create deployment: %w", err)
 	}
