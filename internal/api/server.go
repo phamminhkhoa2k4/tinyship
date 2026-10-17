@@ -13,6 +13,8 @@
 //	GET /apps/{name}/deployments deployment history
 //	GET /deployments/{id} one deployment with its timeline
 //	GET /apps/{name}/logs stream container logs via the worker
+//	POST /apps/{name}/domains attach a hostname (DNS-checked)
+//	GET /apps/{name}/domains list an app's domains
 //
 // There is no authentication yet; the mitigation
 // is the loopback-only bind plus filesystem permissions on the Unix socket
@@ -163,17 +165,29 @@ type server struct {
 	runDir string
 	// workerClient speaks HTTP over that socket; tests inject their own.
 	workerClient *http.Client
+	// resolve performs DNS lookups for the domain attach check; tests
+	// inject their own.
+	resolve Resolver
 }
 
 // newMux builds the route table. Exported behavior for tests via httptest.
 func newMux(s *store.Store, runDir string, logger *slog.Logger) http.Handler {
+	return newMuxWith(s, runDir, logger, func(ctx context.Context, hostname string) ([]net.IP, error) {
+		return net.DefaultResolver.LookupIP(ctx, "ip", hostname)
+	})
+}
+
+// newMuxWith is newMux with an explicit DNS resolver, so domain-attach
+// tests script resolution outcomes without touching the network.
+func newMuxWith(s *store.Store, runDir string, logger *slog.Logger, resolve Resolver) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	srv := &server{
-		store:  s,
-		logger: logger,
-		runDir: runDir,
+		store:   s,
+		logger:  logger,
+		runDir:  runDir,
+		resolve: resolve,
 		workerClient: &http.Client{
 			Transport: &http.Transport{
 				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -193,6 +207,8 @@ func newMux(s *store.Store, runDir string, logger *slog.Logger) http.Handler {
 	mux.HandleFunc("POST /apps/{name}/deploy", srv.handleDeploy)
 	mux.HandleFunc("GET /apps/{name}/deployments", srv.handleListDeployments)
 	mux.HandleFunc("GET /apps/{name}/logs", srv.handleLogs)
+	mux.HandleFunc("POST /apps/{name}/domains", srv.handleAddDomain)
+	mux.HandleFunc("GET /apps/{name}/domains", srv.handleListDomains)
 	mux.HandleFunc("GET /deployments/{id}", srv.handleShowDeployment)
 	return mux
 }
