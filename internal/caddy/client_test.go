@@ -65,13 +65,13 @@ func indexOf(s, sub string) int {
 // fakeAdmin emulates the admin API for one server subtree: current
 // config, ETags, If-Match 412 semantics.
 type fakeAdmin struct {
-	mu               sync.Mutex
-	config           []byte // nil = subtree absent
-	etag             int
-	puts             int
-	failPut          bool // reject every PUT with 500
-	conflictEveryPUT bool // reject every PUT with 412
-	conflictOnce     bool // reject the first PUT with 412
+	mu                sync.Mutex
+	config            []byte // nil = subtree absent
+	etag              int
+	puts              int
+	failPost          bool // reject every POST with 500
+	conflictEveryPOST bool // reject every POST with 412
+	conflictOnce      bool // reject the first POST with 412
 }
 
 func (f *fakeAdmin) handler() http.Handler {
@@ -88,15 +88,15 @@ func (f *fakeAdmin) handler() http.Handler {
 			w.Header().Set("Etag", etagAt(f.etag))
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write(f.config)
-		case http.MethodPut:
+		case http.MethodPost:
 			f.puts++
-			if f.failPut {
+			if f.failPost {
 				http.Error(w, "boom", http.StatusInternalServerError)
 				return
 			}
-			// conflictOnce/conflictEveryPUT model another writer changing
+			// conflictOnce/conflictEveryPOST model another writer changing
 			// the config underneath us.
-			conflict := f.conflictEveryPUT
+			conflict := f.conflictEveryPOST
 			if f.conflictOnce && f.puts == 1 {
 				conflict = true
 			}
@@ -156,7 +156,7 @@ func TestApplyServerCreatesAndVerifies(t *testing.T) {
 }
 
 func TestApplyServerRetriesOn412(t *testing.T) {
-	// Another writer changes the config just before our first PUT, so
+	// Another writer changes the config just before our first POST, so
 	// it 412s; the retry re-reads the ETag and lands.
 	f := &fakeAdmin{config: []byte(`{"stale":true}`), conflictOnce: true}
 	c, done := startFake(t, f.handler())
@@ -171,9 +171,9 @@ func TestApplyServerRetriesOn412(t *testing.T) {
 }
 
 func TestApplyServerGivesUpAfterConflicts(t *testing.T) {
-	// Another writer wins every race, so every PUT 412s: the loop must
+	// Another writer wins every race, so every POST 412s: the loop must
 	// exhaust and report E_CADDY_APPLY.
-	f := &fakeAdmin{conflictEveryPUT: true}
+	f := &fakeAdmin{conflictEveryPOST: true}
 	c, done := startFake(t, f.handler())
 	defer done()
 
@@ -186,7 +186,7 @@ func TestApplyServerGivesUpAfterConflicts(t *testing.T) {
 	}
 }
 
-// mutatingAdmin accepts the PUT then serves different bytes, so the
+// mutatingAdmin accepts the POST then serves different bytes, so the
 // verification GET cannot match the desired config.
 type mutatingAdmin struct {
 	mu   sync.Mutex
@@ -202,7 +202,7 @@ func (m *mutatingAdmin) handler() http.Handler {
 		case http.MethodGet:
 			w.Header().Set("Etag", etagAt(m.etag))
 			_, _ = w.Write([]byte(`{"tampered":true}`))
-		case http.MethodPut:
+		case http.MethodPost:
 			m.etag++ // accept, then serve something else on verify
 			w.WriteHeader(http.StatusOK)
 		}
@@ -242,7 +242,7 @@ func TestCurrentConfigMissingSubtree(t *testing.T) {
 }
 
 func TestApplyServerRejectsBadStatus(t *testing.T) {
-	f := &fakeAdmin{failPut: true}
+	f := &fakeAdmin{failPost: true}
 	c, done := startFake(t, f.handler())
 	defer done()
 

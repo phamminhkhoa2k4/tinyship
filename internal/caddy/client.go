@@ -80,8 +80,8 @@ func (c *Client) CurrentConfig(ctx context.Context) (map[string]any, string, err
 }
 
 // ApplyServer atomically replaces the server subtree with the generated
-// config. It follows the Etag dance: read the current Etag, PUT with
-// If-Match, regenerate and retry on 412, then verify the live config
+// config. It follows the Etag dance: read the current Etag, POST the
+// replacement with If-Match, retry on 412, then verify the live config
 // hashes to the desired one. Any mismatch is an E_CADDY_APPLY error and
 // leaves the previously active config serving.
 func (c *Client) ApplyServer(ctx context.Context, server map[string]any) (string, error) {
@@ -100,7 +100,7 @@ func (c *Client) ApplyServer(ctx context.Context, server map[string]any) (string
 		if err != nil {
 			return "", err
 		}
-		status, err := c.putServer(ctx, etag, want)
+		status, err := c.replaceServer(ctx, etag, want)
 		if err != nil {
 			return "", err
 		}
@@ -113,7 +113,7 @@ func (c *Client) ApplyServer(ctx context.Context, server map[string]any) (string
 		case http.StatusOK, http.StatusCreated:
 			// Applied; fall through to verification below.
 		default:
-			return "", fmt.Errorf("caddy: put %s: unexpected status %d", ServerPath, status)
+			return "", fmt.Errorf("caddy: post %s: unexpected status %d", ServerPath, status)
 		}
 
 		got, _, err := c.CurrentConfig(ctx)
@@ -146,10 +146,12 @@ func (e *UnreachableError) Error() string {
 }
 func (e *UnreachableError) Unwrap() error { return e.Err }
 
-// putServer sends the replacement; the ETag header enforces optimistic
-// concurrency (absent ETag means create-if-missing semantics).
-func (c *Client) putServer(ctx context.Context, etag string, body []byte) (int, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
+// replaceServer sends the replacement. POST is the admin API's replace
+// verb: PUT is create-only and answers 409 once the subtree exists, so
+// an atomic update of a live config must POST. If-Match enforces
+// optimistic concurrency (absent Etag means unconditional replace).
+func (c *Client) replaceServer(ctx context.Context, etag string, body []byte) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		"http://caddy"+ServerPath, bytes.NewReader(body))
 	if err != nil {
 		return 0, err
