@@ -31,6 +31,8 @@ func RunWithIO(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		return cmdVersion(args[1:], stdout, stderr)
 	case "app":
 		return dispatchApp(ctx, args[1:], stdout, stderr)
+	case "domain":
+		return dispatchDomain(ctx, args[1:], stdout, stderr)
 	case "deploy":
 		return cmdDeploy(ctx, args[1:], stdout, stderr)
 	case "logs":
@@ -82,6 +84,7 @@ Usage:
 
 Commands:
   app           Create, list, and show apps
+  domain        Attach hostnames and list them per app
   deploy        Queue a deploy of an app's current config
   logs          Read the current container's logs
   deployments   Show an app's deployment history
