@@ -710,3 +710,142 @@ func TestDeployWaitBudgetFailureExitsOne(t *testing.T) {
 		}
 	}
 }
+
+// --- rollback --------------------------------------------------------------------
+
+// rollbackAPI serves the two calls the CLI makes: app show (to check
+// for named volumes) and the rollback queue.
+func rollbackAPI(t *testing.T, volumes []map[string]any, queue func(w http.ResponseWriter)) {
+	t.Helper()
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/apps/web":
+			cfg := map[string]any{"name": "web", "image": "nginx", "tag": "v1", "port": 80}
+			if volumes != nil {
+				cfg["volumes"] = volumes
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"app": map[string]any{"name": "web", "config": cfg},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/apps/web/rollback":
+			queue(w)
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			writeErr(w, http.StatusNotFound, "E_NOT_FOUND", "x")
+		}
+	}))
+}
+
+func TestRollbackQueuesAndExplainsEnvScope(t *testing.T) {
+	rollbackAPI(t, nil, func(w http.ResponseWriter) {
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"deployment_id": "01RB", "seq": 4, "state": "pending", "kind": "rollback",
+			"rollback_of_seq": 2, "image_ref": "nginx@sha256:aaa",
+			"warnings": []string{},
+		})
+	})
+
+	code, stdout, stderr := run(t, "rollback", "web")
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q, stdout = %q", code, stderr, stdout)
+	}
+	for _, want := range []string{"to seq 2", "01RB", "Env vars are NOT rolled back"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout missing %q:\n%s", want, stdout)
+		}
+	}
+}
+
+func TestRollbackRequiresYesForWritableVolume(t *testing.T) {
+	volumes := []map[string]any{{"name": "data", "path": "/data"}}
+	rollbackAPI(t, volumes, func(w http.ResponseWriter) {
+		t.Error("rollback must not be queued without --yes when volumes exist")
+		writeErr(w, http.StatusConflict, "E_CONFLICT", "x")
+	})
+
+	code, _, stderr := run(t, "rollback", "web")
+	if code != 2 {
+		t.Errorf("exit = %d, want 2 (confirmation required)", code)
+	}
+	if !strings.Contains(stderr, "does NOT revert") || !strings.Contains(stderr, "--yes") {
+		t.Errorf("stderr should warn about volume data and mention --yes:\n%s", stderr)
+	}
+}
+
+func TestRollbackYesProceedsWithWritableVolume(t *testing.T) {
+	volumes := []map[string]any{{"name": "data", "path": "/data"}}
+	rollbackAPI(t, volumes, func(w http.ResponseWriter) {
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"deployment_id": "01RB", "seq": 5, "state": "pending", "kind": "rollback",
+			"rollback_of_seq": 3,
+			"warnings":        []string{"W_VOLUME_DATA_RETAINED: named volume data keeps its data"},
+		})
+	})
+
+	code, stdout, stderr := run(t, "rollback", "web", "--yes")
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q, stdout = %q", code, stderr, stdout)
+	}
+	if !strings.Contains(stdout, "W_VOLUME_DATA_RETAINED") {
+		t.Errorf("stdout should repeat the volume warning:\n%s", stdout)
+	}
+}
+
+func TestRollbackReadOnlyVolumeNeedsNoYes(t *testing.T) {
+	volumes := []map[string]any{{"name": "cfg", "path": "/cfg", "read_only": true}}
+	rollbackAPI(t, volumes, func(w http.ResponseWriter) {
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"deployment_id": "01RB", "seq": 6, "state": "pending", "kind": "rollback",
+			"rollback_of_seq": 1, "warnings": []string{},
+		})
+	})
+
+	code, _, stderr := run(t, "rollback", "web")
+	if code != 0 {
+		t.Errorf("exit = %d, want 0 for a read-only volume; stderr = %q", code, stderr)
+	}
+}
+
+func TestRollbackWaitFailureExitsOne(t *testing.T) {
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/apps/web":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"app": map[string]any{"name": "web", "config": map[string]any{
+					"name": "web", "image": "nginx", "port": 80}},
+			})
+		case r.Method == http.MethodPost:
+			writeJSON(w, http.StatusAccepted, map[string]any{
+				"deployment_id": "01RB", "seq": 7, "state": "pending", "kind": "rollback",
+				"rollback_of_seq": 2, "warnings": []string{},
+			})
+		case strings.HasSuffix(r.URL.Path, "/deployments/01RB"):
+			writeJSON(w, http.StatusOK, map[string]any{
+				"id": "01RB", "seq": 7, "state": "failed",
+				"failure_step": "pull", "failure_code": "E_IMAGE_NOT_FOUND",
+				"failure_message": "manifest unknown",
+			})
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			writeErr(w, http.StatusNotFound, "E_NOT_FOUND", "x")
+		}
+	}))
+
+	code, stdout, _ := run(t, "rollback", "web", "--wait")
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1; stdout = %q", code, stdout)
+	}
+	if !strings.Contains(stdout, "E_IMAGE_NOT_FOUND") || !strings.Contains(stdout, "pull") {
+		t.Errorf("stdout should show the pull failure:\n%s", stdout)
+	}
+}
+
+func TestRollbackRequiresOneAppName(t *testing.T) {
+	code, _, stderr := run(t, "rollback")
+	if code != 2 {
+		t.Errorf("exit = %d, want 2", code)
+	}
+	if !strings.Contains(stderr, "exactly one app name") {
+		t.Errorf("stderr = %q", stderr)
+	}
+}

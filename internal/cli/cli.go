@@ -35,6 +35,8 @@ func RunWithIO(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		return dispatchDomain(ctx, args[1:], stdout, stderr)
 	case "deploy":
 		return cmdDeploy(ctx, args[1:], stdout, stderr)
+	case "rollback":
+		return cmdRollback(ctx, args[1:], stdout, stderr)
 	case "logs":
 		return cmdLogs(ctx, args[1:], stdout, stderr)
 	case "deployments":
@@ -88,6 +90,7 @@ Commands:
   app           Create, list, and show apps
   domain        Attach hostnames and list them per app
   deploy        Queue a deploy of an app's current config
+  rollback      Roll an app back to its most recent good release
   logs          Read the current container's logs
   deployments   Show an app's deployment history
   status        Show API health and apps

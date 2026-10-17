@@ -450,15 +450,23 @@ the free-disk floor or the security policy) and records an audit event.
 
 	// Poll until the deployment reaches a terminal state (a
 	// failed deploy exits non-zero).
-	deadline := time.Now().Add(*waitTimeout)
+	return followDeployment(ctx, c, "deploy", name, queued.DeploymentID, *waitTimeout, stdout, stderr, *jsonOut)
+}
+
+// followDeployment polls one deployment until it succeeds or fails and
+// renders the outcome; a failed deployment exits non-zero. cmd names the
+// calling command for its error messages.
+func followDeployment(ctx context.Context, c *apiClient, cmd, name, depID string,
+	waitTimeout time.Duration, stdout, stderr io.Writer, jsonOut bool) int {
+	deadline := time.Now().Add(waitTimeout)
 	for {
 		var dep deploymentView
-		if err := c.doJSON(ctx, http.MethodGet, "/deployments/"+queued.DeploymentID, nil, &dep); err != nil {
-			fmt.Fprintf(stderr, "tinyship deploy: %v\n", err)
+		if err := c.doJSON(ctx, http.MethodGet, "/deployments/"+depID, nil, &dep); err != nil {
+			fmt.Fprintf(stderr, "tinyship %s: %v\n", cmd, err)
 			return 1
 		}
 		if dep.State == "succeeded" || dep.State == "failed" {
-			if *jsonOut {
+			if jsonOut {
 				raw, _ := json.Marshal(dep)
 				fmt.Fprintln(stdout, string(raw))
 			} else {
@@ -470,14 +478,14 @@ the free-disk floor or the security policy) and records an audit event.
 			return 0
 		}
 		if time.Now().After(deadline) {
-			fmt.Fprintf(stderr, "tinyship deploy: still %s after %s; check `tinyship deployments %s`\n",
-				dep.State, *waitTimeout, name)
+			fmt.Fprintf(stderr, "tinyship %s: still %s after %s; check `tinyship deployments %s`\n",
+				cmd, dep.State, waitTimeout, name)
 			return 1
 		}
 		select {
 		case <-ctx.Done():
-			fmt.Fprintf(stderr, "tinyship deploy: interrupted; deployment %s continues on the server\n",
-				queued.DeploymentID)
+			fmt.Fprintf(stderr, "tinyship %s: interrupted; deployment %s continues on the server\n",
+				cmd, depID)
 			return 130
 		case <-time.After(1 * time.Second):
 		}
@@ -810,4 +818,113 @@ func describeBudget(setMB int, view *budgetView) string {
 		return fmt.Sprintf("auto (derived from the host's %d MiB of RAM)", view.MemTotalMB)
 	}
 	return fmt.Sprintf("%d MiB", setMB)
+}
+
+func cmdRollback(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	fs := flagSet("rollback", stderr, `usage: tinyship rollback <name> [--wait] [--yes]
+
+Queue a rollback to the app's most recent good release: the image (by
+its pinned digest) and config snapshot of the last successful deploy.
+Env vars are NOT rolled back: the container gets whatever the app's
+current env is, so you can roll back an image while keeping new secrets.
+
+A rollback re-runs the old image; named volumes keep their data, which
+a rollback does not revert. --yes confirms that explicitly.
+`)
+	wait := fs.Bool("wait", false, "follow the rollback until it succeeds or fails")
+	waitTimeout := fs.Duration("wait-timeout", 10*time.Minute, "how long --wait may take before giving up")
+	yes := fs.Bool("yes", false, "confirm the rollback without being asked (required when the app has named volumes)")
+	jsonOut := fs.Bool("json", false, "print the queue response verbatim as JSON")
+	pos, code := parseFlags(fs, args)
+	if code >= 0 {
+		return code
+	}
+	if len(pos) != 1 {
+		fmt.Fprintln(stderr, "tinyship rollback: exactly one app name is required")
+		return 2
+	}
+	name := pos[0]
+
+	c := newAPIClient()
+	// Named writable volumes keep their data across an image rollback;
+	// make the operator say so before queueing.
+	hasVolumes, err := appHasWritableVolumes(ctx, c, name)
+	if err != nil {
+		fmt.Fprintf(stderr, "tinyship rollback: %v\n", err)
+		return 1
+	}
+	if hasVolumes && !*yes {
+		fmt.Fprintf(stderr, "tinyship rollback: app %q has named volumes; a rollback does NOT revert the data they hold.\n"+
+			"Re-run with --yes to confirm you want the old image with the current data.\n", name)
+		return 2
+	}
+
+	resp, err := c.do(ctx, http.MethodPost, "/apps/"+name+"/rollback", nil)
+	if err != nil {
+		fmt.Fprintf(stderr, "tinyship rollback: %v\n", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		fmt.Fprintf(stderr, "tinyship rollback: %v\n", apiError(resp))
+		return 1
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	var queued struct {
+		DeploymentID  string   `json:"deployment_id"`
+		Seq           int      `json:"seq"`
+		State         string   `json:"state"`
+		Kind          string   `json:"kind"`
+		RollbackOfSeq int      `json:"rollback_of_seq"`
+		ImageRef      string   `json:"image_ref"`
+		Warnings      []string `json:"warnings"`
+	}
+	if err := json.Unmarshal(raw, &queued); err != nil {
+		fmt.Fprintf(stderr, "tinyship rollback: decode: %v\n", err)
+		return 1
+	}
+	if !*wait {
+		if *jsonOut {
+			fmt.Fprint(stdout, string(raw))
+			return 0
+		}
+		fmt.Fprintf(stdout, "Queued rollback of %s to seq %d: deployment %s (seq %d, %s)\n",
+			name, queued.RollbackOfSeq, queued.DeploymentID, queued.Seq, queued.State)
+		fmt.Fprintf(stdout, "Env vars are NOT rolled back: the container gets the app's current env.\n")
+		for _, warning := range queued.Warnings {
+			fmt.Fprintf(stdout, "Warning: %s\n", warning)
+		}
+		fmt.Fprintf(stdout, "Follow it with: tinyship rollback %s --wait\n", name)
+		return 0
+	}
+	return followDeployment(ctx, c, "rollback", name, queued.DeploymentID,
+		*waitTimeout, stdout, stderr, *jsonOut)
+}
+
+// appHasWritableVolumes reports whether the app's config mounts a named
+// volume that the app may write to.
+func appHasWritableVolumes(ctx context.Context, c *apiClient, name string) (bool, error) {
+	var body struct {
+		App struct {
+			Config json.RawMessage `json:"config"`
+		} `json:"app"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, "/apps/"+name, nil, &body); err != nil {
+		return false, err
+	}
+	var cfg struct {
+		Volumes []struct {
+			Name     string `json:"name"`
+			ReadOnly bool   `json:"read_only"`
+		} `json:"volumes"`
+	}
+	if err := json.Unmarshal(body.App.Config, &cfg); err != nil {
+		return false, fmt.Errorf("parse config: %w", err)
+	}
+	for _, v := range cfg.Volumes {
+		if !v.ReadOnly {
+			return true, nil
+		}
+	}
+	return false, nil
 }
