@@ -48,6 +48,8 @@ type fakeDocker struct {
 	stopped   []string
 	stopGrace time.Duration
 
+	lastPullRef string
+
 	logTail   int // last ContainerLogs arguments, for assertions
 	logSince  time.Duration
 	logFollow bool
@@ -88,10 +90,11 @@ func (f *fakeDocker) lookup(key string) *fakeContainer {
 	return nil
 }
 
-func (f *fakeDocker) PullImage(_ context.Context, _ string, _ *docker.Auth) (string, error) {
+func (f *fakeDocker) PullImage(_ context.Context, ref string, _ *docker.Auth) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pulls++
+	f.lastPullRef = ref
 	if f.pullErr != nil {
 		return "", f.pullErr
 	}
@@ -449,8 +452,9 @@ func TestDeployEnvComesFromStore(t *testing.T) {
 
 // specCapture wraps the fake and records env at create time.
 type specCapture struct {
-	inner    *fakeDocker
-	onCreate func(env []string)
+	inner        *fakeDocker
+	onCreate     func(env []string)
+	onCreateSpec func(spec *policy.ContainerSpec)
 }
 
 func (s *specCapture) PullImage(ctx context.Context, ref string, a *docker.Auth) (string, error) {
@@ -463,6 +467,9 @@ func (s *specCapture) EnsureVolume(ctx context.Context, n string) error {
 func (s *specCapture) CreateContainer(ctx context.Context, spec *policy.ContainerSpec) (string, error) {
 	if s.onCreate != nil {
 		s.onCreate(append([]string{}, spec.Env...))
+	}
+	if s.onCreateSpec != nil {
+		s.onCreateSpec(spec)
 	}
 	return s.inner.CreateContainer(ctx, spec)
 }

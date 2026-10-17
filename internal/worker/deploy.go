@@ -329,11 +329,18 @@ func (p *Deployer) skip(ctx context.Context, d *deployRun, name string, detail a
 
 // --- steps ------------------------------------------------------------------
 
-// stepValidate re-reads and revalidates everything from the database
+// stepValidate re-reads and revalidates everything from the database:
 // app config, env store, image reference, effective strategy, and
-// the previous container to replace.
+// the previous container to replace. A rollback revalidates the target
+// deployment's config snapshot instead of the app's current config, but
+// still takes env vars live: rolling back the image must not roll back
+// the secrets and settings the operator has changed since.
 func (p *Deployer) stepValidate(ctx context.Context, d *deployRun) (any, error) {
-	cfg, err := appconfig.Parse([]byte(d.app.ConfigJSON))
+	configJSON := d.app.ConfigJSON
+	if d.dep.Kind == "rollback" {
+		configJSON = d.dep.ConfigSnapshotJSON
+	}
+	cfg, err := appconfig.Parse([]byte(configJSON))
 	if err != nil {
 		return nil, &pipelineError{code: "E_VALIDATION",
 			err: fmt.Errorf("stored config for app %s: %w", d.app.Name, err)}

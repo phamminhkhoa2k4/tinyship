@@ -207,6 +207,7 @@ func newMuxWith(s *store.Store, runDir string, logger *slog.Logger, resolve Reso
 	mux.HandleFunc("GET /apps", srv.handleListApps)
 	mux.HandleFunc("GET /apps/{name}", srv.handleShowApp)
 	mux.HandleFunc("POST /apps/{name}/deploy", srv.handleDeploy)
+	mux.HandleFunc("POST /apps/{name}/rollback", srv.handleRollback)
 	mux.HandleFunc("GET /apps/{name}/deployments", srv.handleListDeployments)
 	mux.HandleFunc("GET /apps/{name}/logs", srv.handleLogs)
 	mux.HandleFunc("POST /apps/{name}/domains", srv.handleAddDomain)
@@ -312,6 +313,7 @@ type deploymentDTO struct {
 	StartedAt        *time.Time `json:"started_at,omitempty"`
 	FinishedAt       *time.Time `json:"finished_at,omitempty"`
 	PreviousDeployID *string    `json:"previous_deployment_id,omitempty"`
+	RollbackOfID     *string    `json:"rollback_of,omitempty"`
 	Events           []eventDTO `json:"events,omitempty"`
 }
 
@@ -332,6 +334,7 @@ func depToDTO(d *store.Deployment) deploymentDTO {
 		FailureMessage: d.FailureMessage,
 		CreatedAt:      d.CreatedAt, StartedAt: d.StartedAt, FinishedAt: d.FinishedAt,
 		PreviousDeployID: d.PreviousDeploymentID,
+		RollbackOfID:     d.RollbackOfID,
 	}
 }
 

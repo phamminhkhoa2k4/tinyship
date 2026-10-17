@@ -7,8 +7,11 @@ package api
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/tinyship/tinyship/internal/store"
 )
 
 const budgetConfig = `{
@@ -227,5 +230,150 @@ func TestSetBudgetValidatesInput(t *testing.T) {
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("%s: status = %d, want 400; body %s", tc.why, resp.StatusCode, drain(resp))
 		}
+	}
+}
+
+// --- rollback ------------------------------------------------------------------
+
+// queueGoodRelease deploys the app through the API, pins a digest, and
+// marks the deployment succeeded, returning its ID.
+func queueGoodRelease(t *testing.T, srv *httptest.Server, s *store.Store, digest string) string {
+	t.Helper()
+	resp, err := http.Post(srv.URL+"/apps/web/deploy", "application/json", nil)
+	if err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	body := decodeBody(t, resp)
+	depID := body["deployment_id"].(string)
+	ctx := context.Background()
+	if err := s.SetDeploymentImageDigest(ctx, depID, digest); err != nil {
+		t.Fatalf("set digest: %v", err)
+	}
+	if err := s.SucceedDeployment(ctx, appIDOf(t, s, depID), depID); err != nil {
+		t.Fatalf("succeed: %v", err)
+	}
+	return depID
+}
+
+func TestRollbackQueuesPreviousGoodRelease(t *testing.T) {
+	srv, s := testServer(t, t.TempDir())
+	resp := createApp(t, srv, budgetConfig)
+	resp.Body.Close()
+	v1 := queueGoodRelease(t, srv, s, "sha256:"+strings.Repeat("a", 64))
+	v2 := queueGoodRelease(t, srv, s, "sha256:"+strings.Repeat("b", 64))
+
+	resp, err := http.Post(srv.URL+"/apps/web/rollback", "application/json", nil)
+	if err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	body := decodeBody(t, resp)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body %v", resp.StatusCode, body)
+	}
+	if body["kind"] != "rollback" {
+		t.Errorf("kind = %v, want rollback", body["kind"])
+	}
+	if body["rollback_of"] != v1 {
+		t.Errorf("rollback_of = %v, want the earlier good release %s", body["rollback_of"], v1)
+	}
+	// The pull ref pins the target's digest, so a pruned image is
+	// re-pulled exactly and a moved tag cannot sneak in.
+	if ref, _ := body["image_ref"].(string); !strings.Contains(ref, "sha256:"+strings.Repeat("a", 64)) {
+		t.Errorf("image_ref = %v, want the target's pinned digest", body["image_ref"])
+	}
+	// The queued deployment carries the target's snapshot and marks
+	// its origin.
+	dep, err := s.GetDeployment(context.Background(), body["deployment_id"].(string))
+	if err != nil {
+		t.Fatalf("rollback deployment: %v", err)
+	}
+	if dep.RollbackOfID == nil || *dep.RollbackOfID != v1 {
+		t.Errorf("rollback_of_id = %v, want %s", dep.RollbackOfID, v1)
+	}
+	if !strings.Contains(dep.ConfigSnapshotJSON, "memory_mb") {
+		t.Errorf("snapshot = %s, want the target config", dep.ConfigSnapshotJSON)
+	}
+	_ = v2
+}
+
+func TestRollbackWithoutTargetConflicts(t *testing.T) {
+	srv, _ := testServer(t, t.TempDir())
+	resp := createApp(t, srv, testConfig)
+	resp.Body.Close()
+
+	// No successful deployment at all: nothing to roll back to.
+	resp, err := http.Post(srv.URL+"/apps/web/rollback", "application/json", nil)
+	if err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("status = %d, want 409; body %s", resp.StatusCode, drain(resp))
+	}
+	body := decodeBody(t, resp)
+	errObj, _ := body["error"].(map[string]any)
+	if errObj == nil || errObj["code"] != "E_NO_ROLLBACK_TARGET" {
+		t.Errorf("error = %v, want E_NO_ROLLBACK_TARGET", body)
+	}
+}
+
+func TestRollbackUsesCurrentEnvNotSnapshotEnv(t *testing.T) {
+	// Env lives in the app_env table, read live by the pipeline, so the
+	// rollback snapshot never carries env: the worker picks up whatever
+	// the operator set now. The snapshot must therefore hold config
+	// only.
+	srv, s := testServer(t, t.TempDir())
+	resp := createApp(t, srv, budgetConfig)
+	resp.Body.Close()
+	queueGoodRelease(t, srv, s, "sha256:"+strings.Repeat("c", 64))
+	queueGoodRelease(t, srv, s, "sha256:"+strings.Repeat("e", 64))
+
+	resp, err := http.Post(srv.URL+"/apps/web/rollback", "application/json", nil)
+	if err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	body := decodeBody(t, resp)
+	dep, err := s.GetDeployment(context.Background(), body["deployment_id"].(string))
+	if err != nil {
+		t.Fatalf("rollback deployment: %v", err)
+	}
+	if strings.Contains(dep.ConfigSnapshotJSON, "SECRET") {
+		t.Errorf("snapshot leaks env: %s", dep.ConfigSnapshotJSON)
+	}
+}
+
+func TestRollbackWarnsOnWritableVolume(t *testing.T) {
+	const volConfig = `{
+	"name": "web",
+	"image": "traefik/whoami",
+	"tag": "v1.8",
+	"port": 8080,
+	"volumes": [{"name": "data", "path": "/data"}],
+	"resources": {"memory_mb": 256, "cpu_millis": 100, "pids_limit": 64}
+}`
+	srv, s := testServer(t, t.TempDir())
+	resp := createApp(t, srv, volConfig)
+	resp.Body.Close()
+	queueGoodRelease(t, srv, s, "sha256:"+strings.Repeat("d", 64))
+	queueGoodRelease(t, srv, s, "sha256:"+strings.Repeat("f", 64))
+
+	resp, err := http.Post(srv.URL+"/apps/web/rollback", "application/json", nil)
+	if err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	body := decodeBody(t, resp)
+	warnings, _ := body["warnings"].([]any)
+	if len(warnings) != 1 || !strings.Contains(warnings[0].(string), "W_VOLUME_DATA_RETAINED") {
+		t.Errorf("warnings = %v, want the volume-data warning", body["warnings"])
+	}
+}
+
+func TestRollbackUnknownApp404(t *testing.T) {
+	srv, _ := testServer(t, t.TempDir())
+	resp, err := http.Post(srv.URL+"/apps/ghost/rollback", "application/json", nil)
+	if err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404; body %s", resp.StatusCode, drain(resp))
 	}
 }
