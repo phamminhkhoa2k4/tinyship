@@ -201,6 +201,7 @@ func newMuxWith(s *store.Store, runDir string, logger *slog.Logger, resolve Reso
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
+	mux.HandleFunc("GET /budget", srv.handleBudget)
 	mux.HandleFunc("POST /apps", srv.handleCreateApp)
 	mux.HandleFunc("GET /apps", srv.handleListApps)
 	mux.HandleFunc("GET /apps/{name}", srv.handleShowApp)
@@ -440,12 +441,22 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "E_VALIDATION", err.Error())
 		return
 	}
+	// Optional overrides; an empty body keeps the defaults.
+	body, err := readDeployBody(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "E_VALIDATION", err.Error())
+		return
+	}
 
 	depID := store.NewID()
+	payload := fmt.Sprintf(`{"deployment_id":%q}`, depID)
+	if body.Force {
+		payload = fmt.Sprintf(`{"deployment_id":%q,"force":true}`, depID)
+	}
 	job, err := s.store.CreateJob(r.Context(), store.CreateJobInput{
 		AppID:       &app.ID,
 		Type:        worker.DeployJobType,
-		PayloadJSON: fmt.Sprintf(`{"deployment_id":%q}`, depID),
+		PayloadJSON: payload,
 		CreatedBy:   "api",
 	})
 	if err != nil {
@@ -471,6 +482,7 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		"job_id":        job.ID,
 		"seq":           dep.Seq,
 		"state":         dep.State,
+		"forced":        body.Force,
 	})
 }
 

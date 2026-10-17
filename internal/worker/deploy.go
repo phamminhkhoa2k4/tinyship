@@ -438,15 +438,7 @@ func (p *Deployer) stepAdmission(ctx context.Context, d *deployRun) (any, error)
 	budgetMB := budget.BudgetMB
 	budgetSource := "configured"
 	if budgetMB == 0 {
-		// Auto budget: apps may claim at most half of RAM, and the
-		// host keeps at least 1 GiB for itself.
-		budgetMB = memTotal / 2
-		if headroom := memTotal - 1024; headroom < budgetMB {
-			budgetMB = headroom
-		}
-		if budgetMB < 0 {
-			budgetMB = 0
-		}
+		budgetMB = AutoBudgetMB(memTotal)
 		budgetSource = "auto"
 	}
 

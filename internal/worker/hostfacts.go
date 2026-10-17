@@ -61,3 +61,23 @@ func statfsFreeMB(path string) (int, error) {
 
 // numCPU counts logical CPUs visible to the process.
 func numCPU() int { return runtime.NumCPU() }
+
+// MemTotalMB reports the host's total RAM in MiB. It backs both the
+// worker's admission check and the API's budget view, so the two always
+// agree on the same input.
+func MemTotalMB() (int, error) { return readMemTotalMB() }
+
+// AutoBudgetMB derives the default app RAM budget from total RAM: apps
+// may claim at most half of it, and the host keeps at least 1 GiB for
+// itself. A very small host yields a budget of zero, which refuses
+// every deploy until the operator lowers an app's grant or frees RAM.
+func AutoBudgetMB(memTotal int) int {
+	b := memTotal / 2
+	if headroom := memTotal - 1024; headroom < b {
+		b = headroom
+	}
+	if b < 0 {
+		b = 0
+	}
+	return b
+}
