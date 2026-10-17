@@ -21,6 +21,21 @@ DOCKER_MIN_API=1.43   # Docker Engine 24.0
 CHECK_ONLY=0
 ASSUME_YES=0
 FROM_LOCAL=""
+# TINYSHIP_INSTALL_ROOT prefixes every path the installer writes. It
+# exists for development and test hosts: a sandbox install writes files
+# only, touching no users, groups, or services, and needs no root.
+INSTALL_ROOT="${TINYSHIP_INSTALL_ROOT:-}"
+
+sandbox() { [[ -n "$INSTALL_ROOT" ]]; }
+
+# resolve_caddy prints the caddy binary path when one is available.
+resolve_caddy() {
+    if [[ -n "${TINYSHIP_CADDY_BIN:-}" && -x "${TINYSHIP_CADDY_BIN:-}" ]]; then
+        printf '%s\n' "$TINYSHIP_CADDY_BIN"
+    else
+        command -v caddy 2>/dev/null || true
+    fi
+}
 
 usage() {
     cat <<'EOF'
@@ -32,8 +47,12 @@ Options:
   --from-local PATH   Install the given locally built tinyship binary
   -h, --help          Show this help
 
+Environment:
+  TINYSHIP_INSTALL_ROOT  Write under this prefix instead of / (dev/test only;
+                         skips users, groups, services, and the port checks)
+
 Supported hosts: Ubuntu 22.04/24.04, Debian 12, amd64,
-Docker Engine >= 24.0 (API >= 1.43).
+Docker Engine >= 24.0 (API >= 1.43), Caddy >= 2.0.
 EOF
 }
 
@@ -88,16 +107,21 @@ preflight() {
         log "preflight: free disk ${disk_mb} MiB (>= ${MIN_DISK_MB})"
     fi
 
- # 4. Ports 80/443 (Caddy needs them)
-    local port
-    for port in 80 443; do
-        if listening_on "$port"; then
-            fail "port ${port} is already in use; Caddy cannot start (stop the service using it or reassign it)"
-            ok=1
-        else
-            log "preflight: port ${port} free"
-        fi
-    done
+ # 4. Ports 80/443 (Caddy needs them). A sandbox install root starts
+ # no services, so nothing can conflict with them.
+    if sandbox; then
+        log "preflight: sandbox install root set; port checks skipped (no services are started)"
+    else
+        local port
+        for port in 80 443; do
+            if listening_on "$port"; then
+                fail "port ${port} is already in use; Caddy cannot start (stop the service using it or reassign it)"
+                ok=1
+            else
+                log "preflight: port ${port} free"
+            fi
+        done
+    fi
 
  # 5. Docker
     if ! command -v docker >/dev/null 2>&1; then
@@ -114,6 +138,15 @@ preflight() {
             fail "Docker API ${api_version} is older than the required ${DOCKER_MIN_API} (Engine >= 24.0)"
             ok=1
         fi
+    fi
+
+ # 6. Caddy (the proxy that serves domains over HTTPS)
+    local caddy_bin
+    caddy_bin=$(resolve_caddy)
+    if [[ -z "$caddy_bin" ]]; then
+        warn "Caddy is not installed; the installer will skip the proxy wiring (deploys work, domains cannot route)"
+    else
+        log "preflight: Caddy $("$caddy_bin" version 2>/dev/null | awk '{print $1}') available"
     fi
 
     return "$ok"
@@ -133,34 +166,102 @@ listening_on() {
 
 # ------------------------------------------------------------------ install
 
+# write_caddy_baseline installs the base proxy config: admin over the
+# unix socket, automatic HTTPS at Caddy's default (enabled), and an
+# empty tinyship server that the worker replaces wholesale at deploy
+# time. An existing file is never overwritten.
+write_caddy_baseline() {
+    local path="$INSTALL_ROOT/etc/caddy/caddy.json"
+    if [[ -e "$path" ]]; then
+        log "existing $path kept (idempotent install)"
+        return 0
+    fi
+    install -d -m 0755 "$(dirname "$path")"
+    cat >"$path" <<'EOF'
+{
+  "admin": {"listen": "unix//run/caddy/admin.sock|0660"},
+  "apps": {"http": {"servers": {"tinyship": {}}}}
+}
+EOF
+    chmod 0640 "$path"
+    if ! sandbox && getent group caddy >/dev/null 2>&1; then
+        chown root:caddy "$path"
+    fi
+    log "installed $path (proxy baseline; only the tinyship server subtree is ever replaced)"
+}
+
+# write_caddy_unit installs the systemd drop-in that points Caddy at
+# the TinyShip baseline. The service group makes the admin socket group
+# caddy-admin, which tinyship-worker joins; RuntimeDirectory creates
+# /run/caddy. An existing file is never overwritten.
+write_caddy_unit() {
+    local caddy_bin dropin
+    caddy_bin=$(resolve_caddy)
+    dropin="$INSTALL_ROOT/etc/systemd/system/caddy.service.d/tinyship.conf"
+    if [[ -z "$caddy_bin" ]]; then
+        warn "Caddy binary not found; skipping $dropin (install Caddy, then re-run the installer)"
+        return 0
+    fi
+    if [[ -e "$dropin" ]]; then
+        log "existing $dropin kept (idempotent install)"
+        return 0
+    fi
+    install -d -m 0755 "$(dirname "$dropin")"
+    cat >"$dropin" <<EOF
+[Service]
+Group=caddy-admin
+RuntimeDirectory=caddy
+RuntimeDirectoryMode=0755
+ExecStart=
+ExecStart=$caddy_bin run --config /etc/caddy/caddy.json
+EOF
+    chmod 0644 "$dropin"
+    log "installed $dropin (reload with: systemctl daemon-reload && systemctl restart caddy)"
+}
+
 install_from_local() {
     local src=$1
     [[ -x "$src" ]] || { fail "--from-local path is not an executable: $src"; return 1; }
 
-    if [[ $EUID -ne 0 ]]; then
+    if sandbox; then
+        log "sandbox mode: writing under $INSTALL_ROOT only (no users, groups, or services are touched)"
+    elif [[ $EUID -ne 0 ]]; then
         fail "install requires root (re-run with sudo); preflight does not"
         return 1
     fi
 
  # Idempotent: never overwrite existing config, data, or keys.
-    id tinyship >/dev/null 2>&1 || useradd --system --home /var/lib/tinyship --shell /usr/sbin/nologin tinyship
-    id tinyship-worker >/dev/null 2>&1 || useradd --system --home /var/lib/tinyship --shell /usr/sbin/nologin tinyship-worker
-    getent group tinyship >/dev/null 2>&1 || groupadd --system tinyship
-    getent group tinyship-db >/dev/null 2>&1 || groupadd --system tinyship-db
-    getent group tinyship-admin >/dev/null 2>&1 || groupadd --system tinyship-admin
-
-    install -d -m 0755 /usr/local/bin
-    if [[ -x /usr/local/bin/tinyship ]]; then
-        log "existing /usr/local/bin/tinyship kept (idempotent install)"
-    else
-        install -m 0755 "$src" /usr/local/bin/tinyship
-        log "installed /usr/local/bin/tinyship"
+    if ! sandbox; then
+        id tinyship >/dev/null 2>&1 || useradd --system --home /var/lib/tinyship --shell /usr/sbin/nologin tinyship
+        id tinyship-worker >/dev/null 2>&1 || useradd --system --home /var/lib/tinyship --shell /usr/sbin/nologin tinyship-worker
+        getent group tinyship >/dev/null 2>&1 || groupadd --system tinyship
+        getent group tinyship-db >/dev/null 2>&1 || groupadd --system tinyship-db
+        getent group tinyship-admin >/dev/null 2>&1 || groupadd --system tinyship-admin
+        # The worker reaches the proxy admin socket through this group.
+        getent group caddy-admin >/dev/null 2>&1 || groupadd --system caddy-admin
+        usermod -a -G caddy-admin tinyship-worker
     fi
 
-    install -d -o tinyship -g tinyship-db -m 0770 /var/lib/tinyship
-    install -d -o root -g tinyship -m 0640 /etc/tinyship 2>/dev/null || true
+    install -d -m 0755 "$INSTALL_ROOT/usr/local/bin"
+    if [[ -x "$INSTALL_ROOT/usr/local/bin/tinyship" ]]; then
+        log "existing $INSTALL_ROOT/usr/local/bin/tinyship kept (idempotent install)"
+    else
+        install -m 0755 "$src" "$INSTALL_ROOT/usr/local/bin/tinyship"
+        log "installed $INSTALL_ROOT/usr/local/bin/tinyship"
+    fi
 
-    log "systemd units, Caddy baseline, and keys arrive later; not installed by this revision"
+    if sandbox; then
+        install -d -m 0750 "$INSTALL_ROOT/var/lib/tinyship"
+        install -d -m 0750 "$INSTALL_ROOT/etc/tinyship"
+    else
+        install -d -o tinyship -g tinyship-db -m 0770 "$INSTALL_ROOT/var/lib/tinyship"
+        install -d -o root -g tinyship -m 0640 "$INSTALL_ROOT/etc/tinyship" 2>/dev/null || true
+    fi
+
+    write_caddy_baseline
+    write_caddy_unit
+
+    log "TinyShip's own systemd units and keys arrive later; not installed by this revision"
     log "install done; run: tinyship version"
 }
 
