@@ -41,6 +41,8 @@ func RunWithIO(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		return cmdDeployments(ctx, args[1:], stdout, stderr)
 	case "status":
 		return cmdStatus(ctx, args[1:], stdout, stderr)
+	case "budget":
+		return cmdBudget(ctx, args[1:], stdout, stderr)
 	case "help", "--help", "-h":
 		usage(stdout)
 		return 0
@@ -89,6 +91,7 @@ Commands:
   logs          Read the current container's logs
   deployments   Show an app's deployment history
   status        Show API health and apps
+  budget        Show or set the host RAM budget
   version       Print binary, commit, and DB schema versions
   help          Show this help
 

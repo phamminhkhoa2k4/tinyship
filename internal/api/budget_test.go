@@ -163,3 +163,69 @@ func TestDeployRejectsUnknownBodyField(t *testing.T) {
 			resp.StatusCode, drain(resp))
 	}
 }
+
+func TestSetBudgetOverride(t *testing.T) {
+	srv, s := testServer(t, t.TempDir())
+	resp, err := http.Post(srv.URL+"/budget", "application/json",
+		strings.NewReader(`{"budget_mb":1024}`))
+	if err != nil {
+		t.Fatalf("set budget: %v", err)
+	}
+	body := decodeBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %v", resp.StatusCode, body)
+	}
+	if body["budget_mb"] != float64(1024) || body["budget_source"] != "configured" {
+		t.Errorf("view = %v, want configured 1024", body)
+	}
+	// The override persists for the worker's admission check.
+	settings, err := s.GetBudgetSettings(context.Background())
+	if err != nil {
+		t.Fatalf("settings: %v", err)
+	}
+	if settings.BudgetMB != 1024 {
+		t.Errorf("stored budget = %d, want 1024", settings.BudgetMB)
+	}
+	// The change is audited.
+	n, err := s.CountAuditEvents(context.Background(), "budget.set", "")
+	if err != nil {
+		t.Fatalf("count audit: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("budget.set audit events = %d, want 1", n)
+	}
+}
+
+func TestSetBudgetZeroRestoresAuto(t *testing.T) {
+	srv, _ := testServer(t, t.TempDir())
+	resp, err := http.Post(srv.URL+"/budget", "application/json",
+		strings.NewReader(`{"budget_mb":0}`))
+	if err != nil {
+		t.Fatalf("set budget: %v", err)
+	}
+	body := decodeBody(t, resp)
+	if body["budget_source"] != "auto" {
+		t.Errorf("budget_source = %v, want auto after reset", body["budget_source"])
+	}
+}
+
+func TestSetBudgetValidatesInput(t *testing.T) {
+	srv, _ := testServer(t, t.TempDir())
+	for _, tc := range []struct {
+		body string
+		why  string
+	}{
+		{`{"budget_mb":-5}`, "negative budget"},
+		{`{}`, "missing budget_mb"},
+		{`{"budget":"lots"}`, "wrong type"},
+	} {
+		resp, err := http.Post(srv.URL+"/budget", "application/json",
+			strings.NewReader(tc.body))
+		if err != nil {
+			t.Fatalf("%s: %v", tc.why, err)
+		}
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400; body %s", tc.why, resp.StatusCode, drain(resp))
+		}
+	}
+}

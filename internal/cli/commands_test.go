@@ -558,3 +558,155 @@ func TestStatusUnreachableExitsOne(t *testing.T) {
 		t.Errorf("stderr should tell the user how to start the API: %q", stderr)
 	}
 }
+
+// --- budget --------------------------------------------------------------------
+
+func TestBudgetRendersGrantsAndFree(t *testing.T) {
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/budget" {
+			t.Errorf("request = %s %s, want GET /budget", r.Method, r.URL.Path)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"budget_mb": 2048, "budget_source": "configured", "mem_total_mb": 4096,
+			"committed_mb": 768, "free_mb": 1280, "min_free_disk_mb": 3072,
+			"cpu_overcommit": 2.0,
+			"apps": []map[string]any{
+				{"name": "web", "memory_mb": 512},
+				{"name": "api", "memory_mb": 256},
+			},
+		})
+	}))
+
+	code, stdout, stderr := run(t, "budget")
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q", code, stderr)
+	}
+	for _, want := range []string{"2048 MiB", "configured", "Committed  768 MiB", "Free       1280 MiB", "web", "api"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout missing %q:\n%s", want, stdout)
+		}
+	}
+}
+
+func TestBudgetSetMBPostsOverride(t *testing.T) {
+	var got map[string]any
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/budget":
+			var body map[string]any
+			json.NewDecoder(r.Body).Decode(&body)
+			got = body
+			writeJSON(w, http.StatusOK, map[string]any{
+				"budget_mb": 1024, "budget_source": "configured", "mem_total_mb": 4096,
+				"committed_mb": 0, "free_mb": 1024, "apps": []map[string]any{},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/budget":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"budget_mb": 1024, "budget_source": "configured", "mem_total_mb": 4096,
+				"committed_mb": 0, "free_mb": 1024, "apps": []map[string]any{},
+			})
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			writeErr(w, http.StatusNotFound, "E_NOT_FOUND", "x")
+		}
+	}))
+
+	code, stdout, stderr := run(t, "budget", "--set-mb", "1024")
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q, stdout = %q", code, stderr, stdout)
+	}
+	if got == nil || got["budget_mb"] != float64(1024) {
+		t.Errorf("posted body = %v, want budget_mb 1024", got)
+	}
+	if !strings.Contains(stdout, "Budget set to 1024 MiB") {
+		t.Errorf("stdout missing confirmation:\n%s", stdout)
+	}
+}
+
+func TestBudgetRejectsPositionalArgument(t *testing.T) {
+	code, _, stderr := run(t, "budget", "extra")
+	if code != 2 {
+		t.Errorf("exit = %d, want 2 for usage error", code)
+	}
+	if !strings.Contains(stderr, "unexpected argument") {
+		t.Errorf("stderr = %q", stderr)
+	}
+}
+
+// --- deploy --force -------------------------------------------------------------
+
+func TestDeployForceSendsBodyAndWarns(t *testing.T) {
+	var rawBody []byte
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/apps/web/deploy" {
+			t.Errorf("request = %s %s", r.Method, r.URL.Path)
+		}
+		rawBody, _ = io.ReadAll(r.Body)
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"deployment_id": "01DEPLOY", "job_id": "01JOB", "seq": 3, "state": "pending",
+			"forced": true,
+		})
+	}))
+
+	code, stdout, stderr := run(t, "deploy", "web", "--force")
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q, stdout = %q", code, stderr, stdout)
+	}
+	if !strings.Contains(string(rawBody), `"force":true`) {
+		t.Errorf("body = %s, want force:true", rawBody)
+	}
+	if !strings.Contains(stdout, "Warning: --force") {
+		t.Errorf("stdout missing the force warning:\n%s", stdout)
+	}
+}
+
+func TestDeployWithoutForceSendsNoBody(t *testing.T) {
+	var rawBody []byte
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rawBody, _ = io.ReadAll(r.Body)
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"deployment_id": "01DEPLOY", "job_id": "01JOB", "seq": 1, "state": "pending",
+		})
+	}))
+
+	code, stdout, _ := run(t, "deploy", "web")
+	if code != 0 {
+		t.Fatalf("exit = %d, stdout = %q", code, stdout)
+	}
+	if len(rawBody) != 0 {
+		t.Errorf("body = %s, want empty without --force", rawBody)
+	}
+	if strings.Contains(stdout, "Warning") {
+		t.Errorf("stdout should not warn without --force:\n%s", stdout)
+	}
+}
+
+func TestDeployWaitBudgetFailureExitsOne(t *testing.T) {
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			writeJSON(w, http.StatusAccepted, map[string]any{
+				"deployment_id": "01DEPLOY", "job_id": "01JOB", "seq": 1, "state": "pending",
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id": "01DEPLOY", "seq": 1, "state": "failed",
+			"failure_step": "admission", "failure_code": "E_BUDGET_EXCEEDED",
+			"failure_message": "host RAM budget exceeded: over by 128 MiB",
+			"events": []map[string]any{
+				{"step": "validate", "status": "ok"},
+				{"step": "admission", "status": "fail"},
+			},
+		})
+	}))
+
+	code, stdout, _ := run(t, "deploy", "web", "--wait")
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1; stdout = %q", code, stdout)
+	}
+	for _, want := range []string{"admission", "E_BUDGET_EXCEEDED", "over by 128 MiB"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout missing %q:\n%s", want, stdout)
+		}
+	}
+}

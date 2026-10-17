@@ -84,6 +84,42 @@ func (s *server) handleBudget(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, view)
 }
 
+// setBudgetBody is the POST /budget request shape.
+type setBudgetBody struct {
+	// BudgetMB overrides the auto budget; 0 restores the auto
+	// derivation from MemTotal.
+	BudgetMB *int `json:"budget_mb"`
+}
+
+// handleSetBudget serves POST /budget: the operator's explicit override
+// of the host RAM budget. It records an audit row because this changes
+// what the admission guard will allow.
+func (s *server) handleSetBudget(w http.ResponseWriter, r *http.Request) {
+	var body setBudgetBody
+	if err := readJSONBody(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, "E_VALIDATION", err.Error())
+		return
+	}
+	if body.BudgetMB == nil {
+		writeError(w, http.StatusBadRequest, "E_VALIDATION", "budget_mb is required")
+		return
+	}
+	if err := s.store.SetBudgetMB(r.Context(), *body.BudgetMB); err != nil {
+		writeError(w, http.StatusBadRequest, "E_VALIDATION", err.Error())
+		return
+	}
+	if err := s.store.AppendAudit(r.Context(), "api", "budget.set", "host", "",
+		"ok", map[string]any{"budget_mb": *body.BudgetMB}); err != nil {
+		s.logger.Error("audit budget.set", "err", err)
+	}
+	view, err := buildBudgetView(r.Context(), s.store)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "E_INTERNAL", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
 // deployBody is the optional deploy request shape; an empty body means
 // no overrides.
 type deployBody struct {

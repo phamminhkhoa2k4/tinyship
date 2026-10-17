@@ -383,14 +383,18 @@ type deploymentView struct {
 }
 
 func cmdDeploy(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	fs := flagSet("deploy", stderr, `usage: tinyship deploy <name> [--wait]
+	fs := flagSet("deploy", stderr, `usage: tinyship deploy <name> [--wait] [--force]
 
 Queue a deploy of the app's current config. The worker pulls the
 image, pins its digest, creates the container under the documented policy,
 and probes it from the host until healthy twice in a row.
+
+--force admits the deploy past the host RAM budget (it never bypasses
+the free-disk floor or the security policy) and records an audit event.
 `)
 	wait := fs.Bool("wait", false, "follow the deployment until it succeeds or fails")
 	waitTimeout := fs.Duration("wait-timeout", 10*time.Minute, "how long --wait may take before giving up")
+	force := fs.Bool("force", false, "admit past the host RAM budget (audited; disk and policy checks still apply)")
 	jsonOut := fs.Bool("json", false, "print the queue response verbatim as JSON")
 	pos, code := parseFlags(fs, args)
 	if code >= 0 {
@@ -403,7 +407,11 @@ and probes it from the host until healthy twice in a row.
 	name := pos[0]
 
 	c := newAPIClient()
-	resp, err := c.do(ctx, http.MethodPost, "/apps/"+name+"/deploy", nil)
+	var body []byte
+	if *force {
+		body = []byte(`{"force":true}`)
+	}
+	resp, err := c.do(ctx, http.MethodPost, "/apps/"+name+"/deploy", body)
 	if err != nil {
 		fmt.Fprintf(stderr, "tinyship deploy: %v\n", err)
 		return 1
@@ -430,8 +438,14 @@ and probes it from the host until healthy twice in a row.
 		}
 		fmt.Fprintf(stdout, "Queued deploy of %s: deployment %s (seq %d, %s)\n",
 			name, queued.DeploymentID, queued.Seq, queued.State)
+		if *force {
+			fmt.Fprintln(stdout, "Warning: --force admitted this deploy past the host RAM budget; the overrun is recorded in the audit log.")
+		}
 		fmt.Fprintf(stdout, "Follow it with: tinyship deploy %s --wait\n", name)
 		return 0
+	}
+	if *force {
+		fmt.Fprintln(stdout, "Warning: --force admitted this deploy past the host RAM budget; the overrun is recorded in the audit log.")
 	}
 
 	// Poll until the deployment reaches a terminal state (a
@@ -711,4 +725,89 @@ func shortID(id string) string {
 		return id[:10]
 	}
 	return id
+}
+
+// budgetGrantView is one app's memory grant in the budget response.
+type budgetGrantView struct {
+	Name     string `json:"name"`
+	MemoryMB int    `json:"memory_mb"`
+}
+
+// budgetView is the API's budget response.
+type budgetView struct {
+	BudgetMB      int               `json:"budget_mb"`
+	BudgetSource  string            `json:"budget_source"`
+	MemTotalMB    int               `json:"mem_total_mb"`
+	CommittedMB   int               `json:"committed_mb"`
+	FreeMB        int               `json:"free_mb"`
+	MinFreeDiskMB int               `json:"min_free_disk_mb"`
+	CPUOvercommit float64           `json:"cpu_overcommit"`
+	Apps          []budgetGrantView `json:"apps"`
+}
+
+func cmdBudget(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	fs := flagSet("budget", stderr, `usage: tinyship budget [--set-mb N] [--json]
+
+Show the host RAM budget: what apps may claim in total, what each
+running app currently holds, and what remains. The admission guard
+enforces granted limits, not live usage; a deploy that would push the
+total past the budget is refused at the admission step.
+
+--set-mb N overrides the budget explicitly (0 restores the automatic
+derivation from the host's total RAM).
+`)
+	setMB := fs.Int("set-mb", -1, "override the host RAM budget in MiB; 0 restores auto")
+	jsonOut := fs.Bool("json", false, "print machine-readable output")
+	pos, code := parseFlags(fs, args)
+	if code >= 0 {
+		return code
+	}
+	if len(pos) > 0 {
+		fmt.Fprintf(stderr, "tinyship budget: unexpected argument %q\n", pos[0])
+		return 2
+	}
+
+	c := newAPIClient()
+	if *setMB >= 0 {
+		body, _ := json.Marshal(map[string]any{"budget_mb": *setMB})
+		var view budgetView
+		if err := c.doJSON(ctx, http.MethodPost, "/budget", body, &view); err != nil {
+			fmt.Fprintf(stderr, "tinyship budget: %v\n", err)
+			return 1
+		}
+		if !*jsonOut {
+			fmt.Fprintf(stdout, "Budget set to %s\n", describeBudget(*setMB, &view))
+		}
+	}
+	var view budgetView
+	if err := c.doJSON(ctx, http.MethodGet, "/budget", nil, &view); err != nil {
+		fmt.Fprintf(stderr, "tinyship budget: %v\n", err)
+		return 1
+	}
+	if *jsonOut {
+		raw, _ := json.Marshal(view)
+		fmt.Fprintln(stdout, string(raw))
+		return 0
+	}
+	fmt.Fprintf(stdout, "Budget     %d MiB (%s of %d MiB RAM)\n",
+		view.BudgetMB, view.BudgetSource, view.MemTotalMB)
+	fmt.Fprintf(stdout, "Committed  %d MiB across %d running app(s)\n",
+		view.CommittedMB, len(view.Apps))
+	fmt.Fprintf(stdout, "Free       %d MiB\n", view.FreeMB)
+	for _, a := range view.Apps {
+		fmt.Fprintf(stdout, "  %-20s %4d MiB\n", a.Name, a.MemoryMB)
+	}
+	if view.FreeMB < 0 {
+		fmt.Fprintln(stdout, "Warning: apps hold more than the budget; new deploys will be refused until grants are lowered or apps are stopped.")
+	}
+	return 0
+}
+
+// describeBudget words a set-budget confirmation, including the
+// automatic case the operator just restored.
+func describeBudget(setMB int, view *budgetView) string {
+	if setMB == 0 {
+		return fmt.Sprintf("auto (derived from the host's %d MiB of RAM)", view.MemTotalMB)
+	}
+	return fmt.Sprintf("%d MiB", setMB)
 }

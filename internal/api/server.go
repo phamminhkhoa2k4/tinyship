@@ -202,6 +202,7 @@ func newMuxWith(s *store.Store, runDir string, logger *slog.Logger, resolve Reso
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
 	mux.HandleFunc("GET /budget", srv.handleBudget)
+	mux.HandleFunc("POST /budget", srv.handleSetBudget)
 	mux.HandleFunc("POST /apps", srv.handleCreateApp)
 	mux.HandleFunc("GET /apps", srv.handleListApps)
 	mux.HandleFunc("GET /apps/{name}", srv.handleShowApp)
