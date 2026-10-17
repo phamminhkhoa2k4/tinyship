@@ -1,0 +1,560 @@
+package cli
+
+// Command-level tests for the CLI surface: each command is
+// exercised against a scripted API behind TINYSHIP_API, asserting the exact
+// request shape, the rendered output, and the exit code contract
+// (0 ok / 1 failure / 2 usage).
+
+import (
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/tinyship/tinyship/internal/appconfig"
+)
+
+// apiFor points the CLI at a scripted API and returns it.
+func apiFor(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	t.Setenv("TINYSHIP_API", srv.URL)
+	return srv
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func writeErr(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, map[string]any{
+		"error": map[string]string{"code": code, "message": msg},
+	})
+}
+
+// --- app create ------------------------------------------------------------------
+
+func TestAppCreateFromFlagsSendsStrictConfig(t *testing.T) {
+	var got appconfig.Config
+	var rawBody []byte
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/apps" {
+			t.Errorf("request = %s %s, want POST /apps", r.Method, r.URL.Path)
+		}
+		rawBody, _ = io.ReadAll(r.Body)
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"id": "01ABC", "name": "web", "image": "ghcr.io/acme/web", "tag": "v1.2.3",
+			"port": 8080, "warnings": []string{"W_MUTABLE_TAG: not applicable?"},
+		})
+	}))
+
+	code, stdout, stderr := run(t,
+		"app", "create",
+		"--name", "web",
+		"--image", "ghcr.io/acme/web",
+		"--tag", "v1.2.3",
+		"--port", "8080",
+		"--memory-mb", "128",
+		"--strategy", "stop-first",
+		"--volume", "data:/var/lib/app",
+		"--health-type", "http",
+		"--health-path", "/healthz",
+	)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q, stdout = %q", code, stderr, stdout)
+	}
+	// The payload must survive the API's strict parser.
+	cfg, err := appconfig.Parse(rawBody)
+	if err != nil {
+		t.Fatalf("API would reject %s: %v", rawBody, err)
+	}
+	got = *cfg
+	if got.Name != "web" || got.Image != "ghcr.io/acme/web" || got.Tag != "v1.2.3" || got.Port != 8080 {
+		t.Errorf("config = %+v", got)
+	}
+	if got.Resources.MemoryMB != 128 || got.Strategy != "stop-first" {
+		t.Errorf("resources/strategy not forwarded: %+v", got)
+	}
+	if len(got.Volumes) != 1 || got.Volumes[0].Name != "data" || got.Volumes[0].Path != "/var/lib/app" {
+		t.Errorf("volumes = %+v", got.Volumes)
+	}
+	if got.Health == nil || got.Health.Type != "http" || got.Health.Path != "/healthz" {
+		t.Errorf("health = %+v", got.Health)
+	}
+	for _, want := range []string{"Created app web", "ghcr.io/acme/web:v1.2.3", "tinyship deploy web --wait"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout missing %q:\n%s", want, stdout)
+		}
+	}
+}
+
+func TestAppCreateUsageErrors(t *testing.T) {
+	// Required flags missing: 2 before any network call.
+	code, _, stderr := run(t, "app", "create", "--name", "web")
+	if code != 2 {
+		t.Errorf("missing flags: exit = %d, want 2", code)
+	}
+	if !strings.Contains(stderr, "--name, --image and --port") {
+		t.Errorf("stderr = %q", stderr)
+	}
+	// Unknown flag: 2.
+	code, _, _ = run(t, "app", "create", "--name", "a", "--image", "b", "--port", "80", "--nope")
+	if code != 2 {
+		t.Errorf("unknown flag: exit = %d, want 2", code)
+	}
+	// Extra positional argument: 2.
+	code, _, _ = run(t, "app", "create", "--name", "a", "--image", "b", "--port", "80", "extra")
+	if code != 2 {
+		t.Errorf("extra arg: exit = %d, want 2", code)
+	}
+	// Missing subcommand: 2 and list the valid ones.
+	code, _, stderr = run(t, "app")
+	if code != 2 {
+		t.Errorf("bare app: exit = %d, want 2", code)
+	}
+	if !strings.Contains(stderr, "create") || !strings.Contains(stderr, "list") {
+		t.Errorf("bare app stderr should list subcommands: %q", stderr)
+	}
+}
+
+func TestAppCreateAPIErrorExitsOneWithCause(t *testing.T) {
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeErr(w, http.StatusConflict, "E_VALIDATION", `app "web" already exists`)
+	}))
+	code, _, stderr := run(t,
+		"app", "create", "--name", "web", "--image", "nginx", "--port", "80")
+	if code != 1 {
+		t.Errorf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "E_VALIDATION") || !strings.Contains(stderr, "already exists") {
+		t.Errorf("stderr = %q, want code and cause", stderr)
+	}
+}
+
+func TestAppCreateFromFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := `{"name":"fromfile","image":"nginx","tag":"v1","port":9000,"resources":{"memory_mb":64,"cpu_millis":100,"pids_limit":64}}`
+	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var sent []byte
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sent, _ = io.ReadAll(r.Body)
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"id": "01X", "name": "fromfile", "image": "nginx", "tag": "v1", "port": 9000,
+		})
+	}))
+
+	code, stdout, stderr := run(t, "app", "create", "-f", path)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q", code, stderr)
+	}
+	if _, err := appconfig.Parse(sent); err != nil {
+		t.Errorf("file payload rejected by strict parser: %v", err)
+	}
+	if !strings.Contains(stdout, "Created app fromfile") {
+		t.Errorf("stdout = %q", stdout)
+	}
+
+	// A missing file exits 1 with the OS error, no panic.
+	code, _, stderr = run(t, "app", "create", "-f", filepath.Join(t.TempDir(), "nope.json"))
+	if code != 1 {
+		t.Errorf("missing file: exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "nope.json") {
+		t.Errorf("stderr = %q, want the filename", stderr)
+	}
+}
+
+// --- app list / show ---------------------------------------------------------------
+
+func TestAppListRendersTableAndJSON(t *testing.T) {
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"apps": []map[string]any{
+			{"id": "01A", "name": "alpha", "image": "nginx", "tag": "v1", "port": 80,
+				"desired_state": "running", "current_deployment_id": "01DEPLOY123"},
+			{"id": "01B", "name": "beta", "image": "redis", "tag": "latest", "port": 6379,
+				"desired_state": "stopped"},
+		}})
+	}))
+
+	code, stdout, stderr := run(t, "app", "list")
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q", code, stderr)
+	}
+	for _, want := range []string{"NAME", "alpha", "nginx:v1", "01DEPLOY12"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("table missing %q:\n%s", want, stdout)
+		}
+	}
+	// Apps without a deployment show a dash, not a panic.
+	if !strings.Contains(stdout, "-") {
+		t.Errorf("no-deployment cell should be a dash:\n%s", stdout)
+	}
+
+	code, stdout, _ = run(t, "app", "list", "--json")
+	if code != 0 {
+		t.Fatalf("--json exit = %d", code)
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+		t.Fatalf("--json output invalid: %v (%s)", err, stdout)
+	}
+}
+
+func TestAppListEmptyHint(t *testing.T) {
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"apps": []any{}})
+	}))
+	code, stdout, _ := run(t, "app", "list")
+	if code != 0 {
+		t.Fatalf("exit = %d", code)
+	}
+	if !strings.Contains(stdout, "No apps yet") || !strings.Contains(stdout, "tinyship app create") {
+		t.Errorf("empty list should suggest the next command:\n%s", stdout)
+	}
+}
+
+func TestAppShowRendersCurrentDeployment(t *testing.T) {
+	digest := "sha256:aaaa"
+	port := 7878
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/apps/web" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"app": map[string]any{
+				"id": "01A", "name": "web", "desired_state": "running",
+				"config":                map[string]any{"name": "web", "image": "nginx", "tag": "v1", "port": 80},
+				"current_deployment_id": "01DEPLOY123",
+			},
+			"current_deployment": map[string]any{
+				"id": "01DEPLOY123", "seq": 3, "state": "succeeded",
+				"image_ref": "nginx:v1", "image_digest": digest, "host_port": port,
+			},
+		})
+	}))
+
+	code, stdout, stderr := run(t, "app", "show", "web")
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q", code, stderr)
+	}
+	for _, want := range []string{"App web", `"image": "nginx"`, digest, "127.0.0.1", "succeeded"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout missing %q:\n%s", want, stdout)
+		}
+	}
+}
+
+func TestAppShowNotFoundExitsOne(t *testing.T) {
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeErr(w, http.StatusNotFound, "E_NOT_FOUND", "no such app")
+	}))
+	code, _, stderr := run(t, "app", "show", "ghost")
+	if code != 1 {
+		t.Errorf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "E_NOT_FOUND") {
+		t.Errorf("stderr = %q", stderr)
+	}
+	code, _, _ = run(t, "app", "show")
+	if code != 2 {
+		t.Errorf("no name: exit = %d, want 2", code)
+	}
+}
+
+// --- deploy --------------------------------------------------------------------------
+
+func TestDeployWaitSucceededPrintsTimeline(t *testing.T) {
+	var calls atomic.Int32
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost:
+			writeJSON(w, http.StatusAccepted, map[string]any{
+				"deployment_id": "01DEPLOY", "job_id": "01JOB", "seq": 1, "state": "pending",
+			})
+		case strings.HasSuffix(r.URL.Path, "/deployments/01DEPLOY"):
+			// First poll running, then succeeded: proves --wait polls.
+			if calls.Add(1) == 1 {
+				writeJSON(w, http.StatusOK, map[string]any{
+					"id": "01DEPLOY", "seq": 1, "state": "running", "image_ref": "nginx:v1",
+					"events": []map[string]any{{"step": "validate", "status": "ok"}},
+				})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"id": "01DEPLOY", "seq": 1, "state": "succeeded",
+				"image_ref": "nginx:v1", "image_digest": "sha256:bbb",
+				"host_port": 32768,
+				"events": []map[string]any{
+					{"step": "validate", "status": "ok"},
+					{"step": "pull", "status": "ok", "detail": map[string]any{"digest": "sha256:bbb"}},
+					{"step": "health", "status": "ok"},
+				},
+			})
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			writeErr(w, http.StatusNotFound, "E_NOT_FOUND", "x")
+		}
+	}))
+
+	code, stdout, stderr := run(t, "deploy", "web", "--wait")
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q, stdout = %q", code, stderr, stdout)
+	}
+	for _, want := range []string{"SUCCEED", "sha256:bbb", "127.0.0.1:32768", "validate", "health"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout missing %q:\n%s", want, stdout)
+		}
+	}
+	if calls.Load() != 2 {
+		t.Errorf("polls = %d, want 2 (running then succeeded)", calls.Load())
+	}
+}
+
+func TestDeployWaitFailureExitsOneWithStepAndCode(t *testing.T) {
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			writeJSON(w, http.StatusAccepted, map[string]any{
+				"deployment_id": "01DEPLOY", "job_id": "01JOB", "seq": 2, "state": "pending",
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id": "01DEPLOY", "seq": 2, "state": "failed",
+			"image_ref":    "nginx:v1",
+			"failure_step": "health", "failure_code": "E_HEALTH_UNSTABLE",
+			"failure_message": "health check did not pass within the overall window (last error: connection refused)",
+			"events": []map[string]any{
+				{"step": "start", "status": "ok"},
+				{"step": "health", "status": "fail"},
+			},
+		})
+	}))
+
+	code, stdout, _ := run(t, "deploy", "web", "--wait")
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1; stdout = %q", code, stdout)
+	}
+	for _, want := range []string{"FAILED", "health", "E_HEALTH_UNSTABLE", "connection refused", "tinyship deployments web"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout missing %q:\n%s", want, stdout)
+		}
+	}
+}
+
+func TestDeployWithoutWaitQueues(t *testing.T) {
+	var posted bool
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posted = true
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"deployment_id": "01DEPLOY", "job_id": "01JOB", "seq": 1, "state": "pending",
+		})
+	}))
+	code, stdout, stderr := run(t, "deploy", "web")
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q", code, stderr)
+	}
+	if !posted {
+		t.Fatal("no POST reached the API")
+	}
+	if !strings.Contains(stdout, "Queued deploy of web") || !strings.Contains(stdout, "--wait") {
+		t.Errorf("stdout = %q, want queue confirmation + follow-up hint", stdout)
+	}
+}
+
+func TestDeployUsageAndAPIErrors(t *testing.T) {
+	code, _, stderr := run(t, "deploy")
+	if code != 2 {
+		t.Errorf("no name: exit = %d, want 2", code)
+	}
+	if !strings.Contains(stderr, "exactly one app name") {
+		t.Errorf("stderr = %q", stderr)
+	}
+
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeErr(w, http.StatusNotFound, "E_NOT_FOUND",
+			`no such app "ghost"; create it with "tinyship app create"`)
+	}))
+	code, _, stderr = run(t, "deploy", "ghost")
+	if code != 1 {
+		t.Errorf("unknown app: exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "tinyship app create") {
+		t.Errorf("stderr should carry the next step: %q", stderr)
+	}
+}
+
+// --- logs --------------------------------------------------------------------------------
+
+func TestLogsForwardsQueryAndPrintsBody(t *testing.T) {
+	var gotQuery string
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = io.WriteString(w, "ready to serve\nsecond line\n")
+	}))
+
+	code, stdout, stderr := run(t, "logs", "web", "--tail", "25", "--since", "15m")
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q", code, stderr)
+	}
+	if !strings.Contains(stdout, "ready to serve") {
+		t.Errorf("stdout = %q", stdout)
+	}
+	if gotQuery != "tail=25&since=15m" {
+		t.Errorf("query = %q, want tail=25&since=15m", gotQuery)
+	}
+
+	// follow adds follow=1.
+	run(t, "logs", "web", "--follow")
+	if !strings.Contains(gotQuery, "follow=1") {
+		t.Errorf("query = %q, want follow=1", gotQuery)
+	}
+}
+
+func TestLogsUsageAndAPIErrors(t *testing.T) {
+	code, _, stderr := run(t, "logs")
+	if code != 2 {
+		t.Errorf("no name: exit = %d, want 2", code)
+	}
+	code, _, stderr = run(t, "logs", "web", "--since", "banana")
+	if code != 2 {
+		t.Errorf("bad since: exit = %d, want 2", code)
+	}
+	if !strings.Contains(stderr, "Go duration") {
+		t.Errorf("stderr = %q", stderr)
+	}
+
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeErr(w, http.StatusConflict, "E_NO_DEPLOYMENT",
+			`app "web" has no deployed container yet; run "tinyship deploy web"`)
+	}))
+	code, _, stderr = run(t, "logs", "web")
+	if code != 1 {
+		t.Errorf("409: exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "E_NO_DEPLOYMENT") {
+		t.Errorf("stderr = %q", stderr)
+	}
+}
+
+// --- deployments --------------------------------------------------------------------------
+
+func TestDeploymentsTableAndJSON(t *testing.T) {
+	created := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/apps/web/deployments" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"deployments": []map[string]any{
+			{"id": "01AAAAAAAAAAAAAAAAAAAAAAAAA", "seq": 2, "state": "failed",
+				"image_ref": "nginx:v2", "created_at": created.Format(time.RFC3339)},
+			{"id": "01BBBBBBBBBBBBBBBBBBBBBBBBB", "seq": 1, "state": "succeeded",
+				"image_ref": "nginx:v1", "created_at": created.Format(time.RFC3339)},
+		}})
+	}))
+
+	code, stdout, stderr := run(t, "deployments", "web")
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q", code, stderr)
+	}
+	for _, want := range []string{"SEQ", "failed", "succeeded", "nginx:v1", "01AAAAAAAA"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("table missing %q:\n%s", want, stdout)
+		}
+	}
+
+	code, stdout, _ = run(t, "deployments", "web", "--json")
+	if code != 0 {
+		t.Fatalf("--json exit = %d", code)
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+		t.Errorf("invalid JSON: %v (%s)", err, stdout)
+	}
+}
+
+func TestDeploymentsEmpty(t *testing.T) {
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"deployments": []any{}})
+	}))
+	code, stdout, _ := run(t, "deployments", "web")
+	if code != 0 {
+		t.Fatalf("exit = %d", code)
+	}
+	if !strings.Contains(stdout, "No deployments") {
+		t.Errorf("stdout = %q", stdout)
+	}
+}
+
+// --- status ---------------------------------------------------------------------------------
+
+func TestStatusReportsHealthAndApps(t *testing.T) {
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/healthz":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"status": "ok", "version": "0.1.0-dev", "commit": "abc123",
+				"time": time.Now().UTC().Format(time.RFC3339),
+			})
+		case "/apps":
+			writeJSON(w, http.StatusOK, map[string]any{"apps": []map[string]any{
+				{"name": "web", "image": "nginx", "tag": "v1", "desired_state": "running",
+					"current_deployment_id": "01DEPLOY123"},
+			}})
+		default:
+			writeErr(w, http.StatusNotFound, "E_NOT_FOUND", "x")
+		}
+	}))
+
+	code, stdout, stderr := run(t, "status")
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q", code, stderr)
+	}
+	for _, want := range []string{"API     OK (version 0.1.0-dev, commit abc123)", "Apps    1", "web", "nginx:v1", "running"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout missing %q:\n%s", want, stdout)
+		}
+	}
+
+	code, stdout, _ = run(t, "status", "--json")
+	if code != 0 {
+		t.Fatalf("--json exit = %d", code)
+	}
+	var got struct {
+		API  map[string]any `json:"api"`
+		Apps []any          `json:"apps"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+		t.Fatalf("invalid JSON: %v (%s)", err, stdout)
+	}
+	if got.API["status"] != "ok" || len(got.Apps) != 1 {
+		t.Errorf("json = %s", stdout)
+	}
+}
+
+func TestStatusUnreachableExitsOne(t *testing.T) {
+	// Bind a port then close it: connection refused.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	dead := srv.URL
+	srv.Close()
+	t.Setenv("TINYSHIP_API", dead)
+
+	code, _, stderr := run(t, "status")
+	if code != 1 {
+		t.Errorf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "tinyship api") {
+		t.Errorf("stderr should tell the user how to start the API: %q", stderr)
+	}
+}
