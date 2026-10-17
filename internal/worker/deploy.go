@@ -48,6 +48,11 @@ type Deployer struct {
 	Logger            *slog.Logger
 	Actor             string // audit actor (worker id)
 	HealthConsecutive int    // default HealthConsecutivePasses
+	// Caddy applies generated proxy config; nil means no route engine
+	// is configured and an app with active domains fails loudly.
+	Caddy Caddy
+	// Probe performs the final check; nil means DefaultProbe.
+	Probe ProbeFunc
 }
 
 // NewDeployer wires the pipeline over a store and an allowlisted Docker
@@ -212,9 +217,9 @@ func (p *Deployer) run(ctx context.Context, job *store.Job) error {
 	return err
 }
 
-// pipeline executes the steps in order. route_switch and final_check
-// record skip (there is no Caddy integration, so domains never exist) —
-// the timeline shows the full pipeline with explicit reasons.
+// pipeline executes the steps in order. route_switch applies the
+// generated proxy config when the app has active domains and records
+// skip otherwise; final_check probes those domains through the proxy.
 func (p *Deployer) pipeline(ctx context.Context, d *deployRun, log *slog.Logger) error {
 	if err := p.step(ctx, d, "validate", func() (any, error) {
 		return p.stepValidate(ctx, d)
@@ -596,37 +601,6 @@ func (p *Deployer) stepHealth(ctx context.Context, d *deployRun, log *slog.Logge
 	log.Info("deploy: health check passed", "target", target, "type", d.cfg.Health.Type)
 	return map[string]any{"target": target, "type": d.cfg.Health.Type,
 		"consecutive_passes": want}, nil
-}
-
-// stepRouteSwitch would regenerate the Caddy server config from the DB.
-// There is no Caddy integration, so an app with active domains must fail
-// loudly instead of silently not routing; an app with none records skip.
-func (p *Deployer) stepRouteSwitch(ctx context.Context, d *deployRun) (any, error) {
-	domains, err := p.Store.ListActiveDomains(ctx, d.app.ID)
-	if err != nil {
-		return nil, &RetryableError{err}
-	}
-	d.domains = domains
-	if len(domains) > 0 {
-		return nil, &pipelineError{code: "E_CADDY_APPLY", err: fmt.Errorf(
-			"app has %d active domain(s) but Caddy integration is not present "+
-				"in this release; refusing to report success without routing", len(domains))}
-	}
-	p.skip(ctx, d, "route_switch", map[string]any{
-		"reason": "no active domains; Caddy route generation is not available"})
-	return nil, nil
-}
-
-// stepFinalCheck probes Caddy over SNI for each active domain.
-// Without domains it records skip, exactly as the spec prescribes.
-func (p *Deployer) stepFinalCheck(ctx context.Context, d *deployRun) (any, error) {
-	if len(d.domains) > 0 {
-		return nil, &pipelineError{code: "E_FINAL_CHECK_FAILED", err: fmt.Errorf(
-			"%d active domain(s) require the Caddy final check", len(d.domains))}
-	}
-	p.skip(ctx, d, "final_check", map[string]any{
-		"reason": "no active domains to probe"})
-	return nil, nil
 }
 
 // stepRetireOld stops and removes the previous container. Per

@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tinyship/tinyship/internal/caddy"
 	"github.com/tinyship/tinyship/internal/docker"
 	"github.com/tinyship/tinyship/internal/store"
 )
@@ -63,6 +64,9 @@ type Config struct {
 	// no log socket (unit tests).
 	RunDir string
 	Docker Docker
+	// Caddy, when set, makes the worker regenerate the proxy config
+	// from the database at startup (crash recovery for route state).
+	Caddy Caddy
 }
 
 // Run starts the worker and blocks until ctx is cancelled. argv is accepted
@@ -107,9 +111,16 @@ func Run(ctx context.Context, argv []string) int {
 		return 1
 	}
 
+	// Route engine: the deployer talks to the Caddy admin socket, and
+	// boot regenerates the config from the database so routes always
+	// reflect the last succeeded deployments.
+	cc := caddy.NewClient(envOr("TINYSHIP_CADDY_ADMIN", caddy.DefaultSocket))
+	dplr := NewDeployer(s, dw, logger, cfg.WorkerID)
+	dplr.Caddy = cc
 	cfg.Handlers = map[string]Handler{
-		DeployJobType: NewDeployer(s, dw, logger, cfg.WorkerID).Handler(),
+		DeployJobType: dplr.Handler(),
 	}
+	cfg.Caddy = cc
 	// Log socket: /run/tinyship/worker.sock by default;
 	// TINYSHIP_RUN_DIR moves the whole run dir for development and tests.
 	cfg.RunDir = envOr("TINYSHIP_RUN_DIR", DefaultRunDir)
@@ -148,6 +159,16 @@ func RunStore(ctx context.Context, s *store.Store, cfg Config) error {
 
 	logger.Info("worker: starting",
 		"id", cfg.WorkerID, "db", cfg.DBPath, "handlers", len(cfg.Handlers))
+
+	// Converge proxy routes to the database before claiming jobs: a
+	// crash during a previous route switch must not leave traffic on a
+	// half-switched config. Failure is logged and non-fatal: route
+	// updates during deploys will surface it again with full context.
+	if cfg.Caddy != nil {
+		if err := RegenerateRoutes(ctx, s, cfg.Caddy, logger); err != nil {
+			logger.Error("worker: boot route regeneration failed", "err", err)
+		}
+	}
 
 	// The read-only log socket: the API reaches container logs only
 	// through here, and only after the ownership checks.
