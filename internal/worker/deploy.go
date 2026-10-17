@@ -53,6 +53,12 @@ type Deployer struct {
 	Caddy Caddy
 	// Probe performs the final check; nil means DefaultProbe.
 	Probe ProbeFunc
+	// Host facts the admission guard reads; nil means the real readers
+	// (/proc/meminfo, statfs of the Docker data path, runtime CPUs).
+	// Tests pin them to a scenario instead of the real host.
+	MemTotalMB func() (int, error)
+	DiskFreeMB func(path string) (int, error)
+	NumCPUs    func() int
 }
 
 // NewDeployer wires the pipeline over a store and an allowlisted Docker
@@ -122,9 +128,11 @@ func codeOf(err error, fallback string) string {
 	return fallback
 }
 
-// deployPayload is the strict job payload.
+// deployPayload is the strict job payload. Force admits a deploy past
+// the RAM budget (never past the disk floor or the security policy).
 type deployPayload struct {
 	DeploymentID string `json:"deployment_id"`
+	Force        bool   `json:"force,omitempty"`
 }
 
 func decodeDeployPayload(raw string) (*deployPayload, error) {
@@ -151,7 +159,10 @@ type deployRun struct {
 	digest         string
 	hostPort       int
 	strategy       string
+	strategyAuto   bool // strategy was derived, not chosen: admission may lower it
+	oldMemMB       int  // granted memory of the deployment being replaced (0 = none)
 	domains        []string
+	force          bool   // admitted past the RAM budget by explicit request
 	containerID    string // the new container (created or reused this run)
 	containerName  string
 	oldContainerID string
@@ -191,7 +202,7 @@ func (p *Deployer) run(ctx context.Context, job *store.Job) error {
 		return &RetryableError{err}
 	}
 
-	d := &deployRun{dep: dep, app: app}
+	d := &deployRun{dep: dep, app: app, force: pl.Force}
 	log := p.Logger.With("job", job.ID, "deployment", dep.ID, "app", app.Name, "seq", dep.Seq)
 	log.Info("deploy: starting pipeline", "image", dep.ImageRef)
 
@@ -353,11 +364,15 @@ func (p *Deployer) stepValidate(ctx context.Context, d *deployRun) (any, error) 
 	}
 
 	// Effective strategy: auto means stop-first when any volume is
-	// writable, otherwise start-first.
+	// writable, otherwise start-first. An auto start-first may be
+	// lowered to stop-first by admission when the parallel peak does
+	// not fit the budget.
+	d.strategyAuto = false
 	switch cfg.Strategy {
 	case "start-first", "stop-first":
 		d.strategy = cfg.Strategy
 	default: // auto
+		d.strategyAuto = true
 		d.strategy = "start-first"
 		for _, v := range cfg.Volumes {
 			if !v.ReadOnly {
@@ -386,8 +401,11 @@ func (p *Deployer) stepValidate(ctx context.Context, d *deployRun) (any, error) 
 			if prev.ContainerID != nil {
 				d.oldContainerID = *prev.ContainerID
 			}
-			if prevCfg, err := appconfig.Parse([]byte(prev.ConfigSnapshotJSON)); err == nil && prevCfg.StopGraceS > 0 {
-				d.oldGrace = time.Duration(prevCfg.StopGraceS) * time.Second
+			if prevCfg, err := appconfig.Parse([]byte(prev.ConfigSnapshotJSON)); err == nil {
+				if prevCfg.StopGraceS > 0 {
+					d.oldGrace = time.Duration(prevCfg.StopGraceS) * time.Second
+				}
+				d.oldMemMB = prevCfg.Resources.MemoryMB
 			}
 		}
 	}
@@ -398,10 +416,117 @@ func (p *Deployer) stepValidate(ctx context.Context, d *deployRun) (any, error) 
 	}, nil
 }
 
-// stepAdmission allocates the loopback host port in one transaction. The
-// full budget algorithm is not implemented yet; the step still
-// records the memory limit it would account for.
+// stepAdmission enforces the host guardrails before anything is pulled
+// or created: the RAM budget with the parallel-peak rule, the free-disk
+// floor, and the CPU overcommit warning. It also allocates the loopback
+// host port in the same step, so a deploy that is refused never holds a
+// port.
+//
+// The budget is the granted limits, not live usage. When the strategy
+// was derived (auto), a start-first peak that does not fit is lowered
+// to stop-first rather than refused; an explicitly chosen start-first
+// is never silently changed.
 func (p *Deployer) stepAdmission(ctx context.Context, d *deployRun) (any, error) {
+	budget, err := p.Store.GetBudgetSettings(ctx)
+	if err != nil {
+		return nil, &RetryableError{err}
+	}
+	memTotal, err := p.memTotalMB()
+	if err != nil {
+		return nil, &RetryableError{err}
+	}
+	budgetMB := budget.BudgetMB
+	budgetSource := "configured"
+	if budgetMB == 0 {
+		// Auto budget: apps may claim at most half of RAM, and the
+		// host keeps at least 1 GiB for itself.
+		budgetMB = memTotal / 2
+		if headroom := memTotal - 1024; headroom < budgetMB {
+			budgetMB = headroom
+		}
+		if budgetMB < 0 {
+			budgetMB = 0
+		}
+		budgetSource = "auto"
+	}
+
+	// Committed memory: every other running app's granted limit. A
+	// corrupt stored config must not silently vanish from the sum, so
+	// it counts at the default limit.
+	running, err := p.Store.ListRunningApps(ctx)
+	if err != nil {
+		return nil, &RetryableError{err}
+	}
+	committed, committedCPU := 0, 0
+	for _, a := range running {
+		if a.ID == d.app.ID {
+			continue
+		}
+		mb, cpu := appconfig.DefaultMemoryMB, appconfig.DefaultCPUMillis
+		if otherCfg, err := appconfig.Parse([]byte(a.ConfigJSON)); err == nil {
+			mb, cpu = otherCfg.Resources.MemoryMB, otherCfg.Resources.CPUMillis
+		}
+		committed += mb
+		committedCPU += cpu
+	}
+
+	newMB := d.cfg.Resources.MemoryMB
+	// Peak accounting: start-first runs old and new together, so the
+	// budget must fit both. The old limit is the snapshot of the
+	// deployment being replaced; no old container, no peak.
+	needed := newMB
+	if d.strategy == "start-first" && d.oldContainerID != "" {
+		needed = d.oldMemMB + newMB
+	}
+	if d.strategyAuto && committed+needed > budgetMB && committed+newMB <= budgetMB {
+		d.strategy = "stop-first"
+		needed = newMB
+		if err := p.Store.SetDeploymentStrategy(ctx, d.dep.ID, d.strategy); err != nil {
+			return nil, &RetryableError{err}
+		}
+	}
+
+	warnings := []string{}
+	over := committed + needed - budgetMB
+	if over > 0 {
+		if !d.force {
+			return nil, &pipelineError{code: "E_BUDGET_EXCEEDED", err: fmt.Errorf(
+				"host RAM budget exceeded: %d MiB committed + %d MiB needed = %d MiB, "+
+					"budget %d MiB (%s), over by %d MiB; lower resources.memory_mb, "+
+					"stop or delete another app, or redeploy with --force",
+				committed, needed, committed+needed, budgetMB, budgetSource, over)}
+		}
+		// Force admits past the RAM budget only; the disk floor and
+		// the security policy still apply below and in later steps.
+		warnings = append(warnings, "W_BUDGET_FORCED")
+		if err := p.Store.AppendAudit(ctx, p.Actor, "admission.force", "deployment",
+			d.dep.ID, "forced", map[string]any{
+				"app": d.app.Name, "budget_mb": budgetMB, "budget_source": budgetSource,
+				"committed_mb": committed, "requested_mb": needed, "over_by_mb": over,
+			}); err != nil {
+			return nil, &RetryableError{err}
+		}
+	}
+
+	// Disk floor: refuse to fill the disk that holds Docker's data.
+	// This is never bypassed by force.
+	free, err := p.diskFreeMB(DockerDataPath)
+	if err != nil {
+		return nil, &RetryableError{err}
+	}
+	if free < budget.MinFreeDiskMB {
+		return nil, &pipelineError{code: "E_DISK_LOW", err: fmt.Errorf(
+			"only %d MiB free on the Docker data partition, floor is %d MiB; "+
+				"free disk space (remove old images or containers) and retry",
+			free, budget.MinFreeDiskMB)}
+	}
+
+	// CPU overcommit is a warning, never a rejection.
+	totalCPU := committedCPU + d.cfg.Resources.CPUMillis
+	if float64(totalCPU) > float64(p.numCPUs())*1000*budget.CPUOvercommit {
+		warnings = append(warnings, "W_CPU_OVERCOMMIT")
+	}
+
 	port, err := p.Store.AllocateHostPort(ctx, d.dep.ID)
 	if err != nil {
 		if strings.HasPrefix(err.Error(), "E_") {
@@ -411,11 +536,34 @@ func (p *Deployer) stepAdmission(ctx context.Context, d *deployRun) (any, error)
 	}
 	d.hostPort = port
 	return map[string]any{
-		"host_port": port,
-		"memory_mb": d.cfg.Resources.MemoryMB,
-		"strategy":  d.strategy,
-		"note":      "budget/disk admission is not implemented; this step records the limit only",
+		"host_port": port, "memory_mb": newMB, "strategy": d.strategy,
+		"budget_mb": budgetMB, "budget_source": budgetSource,
+		"committed_mb": committed, "needed_mb": needed,
+		"disk_free_mb": free, "warnings": warnings,
 	}, nil
+}
+
+// memTotalMB, diskFreeMB, numCPUs read the host facts admission checks
+// against; the real readers back the fields of the same name.
+func (p *Deployer) memTotalMB() (int, error) {
+	if p.MemTotalMB != nil {
+		return p.MemTotalMB()
+	}
+	return readMemTotalMB()
+}
+
+func (p *Deployer) diskFreeMB(path string) (int, error) {
+	if p.DiskFreeMB != nil {
+		return p.DiskFreeMB(path)
+	}
+	return statfsFreeMB(path)
+}
+
+func (p *Deployer) numCPUs() int {
+	if p.NumCPUs != nil {
+		return p.NumCPUs()
+	}
+	return numCPU()
 }
 
 // stepPull pulls the image and pins the digest. Network and 5xx

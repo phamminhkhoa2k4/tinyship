@@ -251,8 +251,14 @@ type deployFixture struct {
 
 func newDeployFixture(t *testing.T, cfgJSON string) *deployFixture {
 	t.Helper()
+	return newDeployFixtureIn(t, testStore(t), cfgJSON)
+}
+
+// newDeployFixtureIn adds one app+deployment on an existing store, so a
+// scenario can pin several apps against one shared budget.
+func newDeployFixtureIn(t *testing.T, s *store.Store, cfgJSON string) *deployFixture {
+	t.Helper()
 	ctx := context.Background()
-	s := testStore(t)
 	cfg, err := appconfig.Parse([]byte(cfgJSON))
 	if err != nil {
 		t.Fatalf("fixture config: %v", err)
@@ -282,11 +288,22 @@ func newDeployFixture(t *testing.T, cfgJSON string) *deployFixture {
 		t.Fatalf("create deployment: %v", err)
 	}
 	fk := newFakeDocker()
+	dplr := NewDeployer(s, fk, slog.New(slog.DiscardHandler), "test-worker")
+	pinHostFacts(dplr)
 	return &deployFixture{
 		t: t, ctx: ctx, s: s, fk: fk, app: app,
 		depID: depID, job: job, depRec: depRec,
-		dplr: NewDeployer(s, fk, slog.New(slog.DiscardHandler), "test-worker"),
+		dplr: dplr,
 	}
+}
+
+// pinHostFacts gives a deployer a generous fake host so admission never
+// depends on the machine running the tests. Scenario tests re-pin the
+// fields with tight values.
+func pinHostFacts(p *Deployer) {
+	p.MemTotalMB = func() (int, error) { return 8192, nil }
+	p.DiskFreeMB = func(string) (int, error) { return 100 * 1024, nil }
+	p.NumCPUs = func() int { return 4 }
 }
 
 // run executes the handler with the fixture's attempt counters. The
@@ -413,6 +430,7 @@ func TestDeployEnvComesFromStore(t *testing.T) {
 	var captured []string
 	recorder := &specCapture{inner: f.fk, onCreate: func(env []string) { captured = env }}
 	f.dplr = NewDeployer(f.s, recorder, slog.New(slog.DiscardHandler), "test-worker")
+	pinHostFacts(f.dplr)
 	f.dplr.HealthConsecutive = 1
 
 	now := time.Now().UTC().UnixMilli()
