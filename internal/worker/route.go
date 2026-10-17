@@ -76,7 +76,7 @@ func RegenerateRoutes(ctx context.Context, s *store.Store, cc Caddy, log *slog.L
 	if applied == "" && len(rows) == 0 {
 		return nil
 	}
-	server, err := caddy.BuildServer(rows, nil)
+	server, err := caddy.BuildServer(rows, buildOptions(nil))
 	if err != nil {
 		return err
 	}
@@ -99,12 +99,28 @@ func RegenerateRoutes(ctx context.Context, s *store.Store, cc Caddy, log *slog.L
 	return nil
 }
 
+// buildOptions maps the environment to one generation's options.
+// TINYSHIP_CADDY_LISTEN and TINYSHIP_CADDY_AUTO_HTTPS=off exist for
+// development and test hosts: they cannot bind privileged ports and
+// have no public DNS, so the proxy listens on a high port with
+// certificate automation disabled. Installed hosts use the defaults.
+func buildOptions(ov *caddy.Override) caddy.BuildOptions {
+	opts := caddy.BuildOptions{Override: ov}
+	if v := os.Getenv("TINYSHIP_CADDY_LISTEN"); v != "" {
+		opts.Listen = v
+	}
+	if os.Getenv("TINYSHIP_CADDY_AUTO_HTTPS") == "off" {
+		opts.DisableAutoHTTPS = true
+	}
+	return opts
+}
+
 // applyServer generates, applies, and records the hash for one set of
 // route rows. ov redirects one app's upstream to a port the database
 // does not know yet (the new container during route_switch); nil means
 // the database as-is.
 func (p *Deployer) applyServer(ctx context.Context, rows []store.RouteRow, ov *caddy.Override) (string, error) {
-	server, err := caddy.BuildServer(rows, ov)
+	server, err := caddy.BuildServer(rows, buildOptions(ov))
 	if err != nil {
 		return "", &pipelineError{code: "E_CADDY_APPLY", err: err}
 	}

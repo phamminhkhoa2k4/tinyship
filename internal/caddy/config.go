@@ -20,12 +20,32 @@ type Override struct {
 	HostPort int
 }
 
+// DefaultListen is the proxy listen address on an installed host.
+const DefaultListen = ":443"
+
+// BuildOptions tunes one generation of the server config. The zero
+// value produces the installed-host shape: listen on DefaultListen with
+// automatic HTTPS left at Caddy's default (enabled).
+type BuildOptions struct {
+	// Override points one app's upstream at a port the database does
+	// not know yet; nil means the database as-is.
+	Override *Override
+	// Listen replaces DefaultListen. Development and test hosts cannot
+	// bind privileged ports, so they point this at a high port.
+	Listen string
+	// DisableAutoHTTPS emits the explicit switch that keeps Caddy from
+	// provisioning certificates: hosts without public DNS or reachable
+	// ACME endpoints cannot obtain one, and the attempt would stall
+	// the route.
+	DisableAutoHTTPS bool
+}
+
 // BuildServer generates the full `tinyship` server object from database
 // rows. The shape is closed: reverse_proxy to 127.0.0.1:<port> only, a
 // terminal host match per route, and a final 404 so unknown hostnames
 // hit nothing. Output is deterministic (routes sorted by hostname) so
 // the config hash is stable across regenerations.
-func BuildServer(rows []store.RouteRow, ov *Override) (map[string]any, error) {
+func BuildServer(rows []store.RouteRow, opts BuildOptions) (map[string]any, error) {
 	sorted := append([]store.RouteRow(nil), rows...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Hostname < sorted[j].Hostname })
 
@@ -41,7 +61,7 @@ func BuildServer(rows []store.RouteRow, ov *Override) (map[string]any, error) {
 		seen[r.Hostname] = true
 
 		port := r.HostPort
-		if ov != nil && ov.AppID != "" && r.AppID == ov.AppID {
+		if ov := opts.Override; ov != nil && ov.AppID != "" && r.AppID == ov.AppID {
 			port = ov.HostPort
 		}
 		if port < policy.MinHostPort || port > policy.MaxHostPort {
@@ -69,11 +89,19 @@ func BuildServer(rows []store.RouteRow, ov *Override) (map[string]any, error) {
 		}},
 	})
 
-	return map[string]any{
-		"listen":          []string{":443"},
+	listen := opts.Listen
+	if listen == "" {
+		listen = DefaultListen
+	}
+	server := map[string]any{
+		"listen":          []string{listen},
 		"routes":          routes,
 		"strict_sni_host": true,
-	}, nil
+	}
+	if opts.DisableAutoHTTPS {
+		server["automatic_https"] = map[string]any{"disable": true}
+	}
+	return server, nil
 }
 
 // Hash returns the hex sha256 of the canonical JSON encoding. It is the

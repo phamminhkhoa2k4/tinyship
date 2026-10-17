@@ -194,6 +194,21 @@ func TestDeployRouteSwitchRetriesWhenCaddyUnreachable(t *testing.T) {
 	}
 }
 
+func TestBuildOptionsFromEnv(t *testing.T) {
+	// Installed-host defaults: no env set.
+	opts := buildOptions(nil)
+	if opts.Listen != "" || opts.DisableAutoHTTPS || opts.Override != nil {
+		t.Errorf("zero env = %+v, want zero options", opts)
+	}
+
+	t.Setenv("TINYSHIP_CADDY_LISTEN", ":8443")
+	t.Setenv("TINYSHIP_CADDY_AUTO_HTTPS", "off")
+	opts = buildOptions(&caddy.Override{AppID: "appA", HostPort: 20017})
+	if opts.Listen != ":8443" || !opts.DisableAutoHTTPS || opts.Override == nil {
+		t.Errorf("env options = %+v, want listen :8443, auto-https off, override kept", opts)
+	}
+}
+
 func TestRegenerateRoutesAppliesWhenHashDiffers(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)

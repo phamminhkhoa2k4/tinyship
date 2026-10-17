@@ -42,7 +42,7 @@ func sampleServer(t *testing.T) map[string]any {
 	t.Helper()
 	srv, err := BuildServer([]store.RouteRow{
 		{DomainID: "dom1", AppID: "appA", Hostname: "a.example.com", HostPort: 20017},
-	}, nil)
+	}, BuildOptions{})
 	if err != nil {
 		t.Fatalf("BuildServer: %v", err)
 	}

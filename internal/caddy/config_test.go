@@ -14,7 +14,7 @@ func TestBuildServerShape(t *testing.T) {
 		{DomainID: "dom2", AppID: "appB", Hostname: "b.example.com", HostPort: 20018},
 		{DomainID: "dom1", AppID: "appA", Hostname: "a.example.com", HostPort: 20017},
 	}
-	server, err := BuildServer(rows, nil)
+	server, err := BuildServer(rows, BuildOptions{})
 	if err != nil {
 		t.Fatalf("BuildServer: %v", err)
 	}
@@ -60,7 +60,7 @@ func TestBuildServerOverride(t *testing.T) {
 		{DomainID: "dom1", AppID: "appA", Hostname: "a.example.com", HostPort: 20017},
 		{DomainID: "dom2", AppID: "appB", Hostname: "b.example.com", HostPort: 20018},
 	}
-	server, err := BuildServer(rows, &Override{AppID: "appA", HostPort: 20099})
+	server, err := BuildServer(rows, BuildOptions{Override: &Override{AppID: "appA", HostPort: 20099}})
 	if err != nil {
 		t.Fatalf("BuildServer: %v", err)
 	}
@@ -76,26 +76,61 @@ func TestBuildServerOverride(t *testing.T) {
 	}
 }
 
+func TestBuildServerOptions(t *testing.T) {
+	rows := []store.RouteRow{
+		{DomainID: "dom1", AppID: "appA", Hostname: "a.example.com", HostPort: 20017},
+	}
+
+	// Zero options produce the installed-host shape.
+	def, err := BuildServer(rows, BuildOptions{})
+	if err != nil {
+		t.Fatalf("BuildServer default: %v", err)
+	}
+	if listen := def["listen"].([]string); len(listen) != 1 || listen[0] != DefaultListen {
+		t.Errorf("default listen = %v, want [%s]", listen, DefaultListen)
+	}
+	if _, present := def["automatic_https"]; present {
+		t.Error("default config must leave automatic HTTPS at Caddy's default")
+	}
+
+	// Development hosts replace the listen address and disable
+	// certificate automation explicitly.
+	dev, err := BuildServer(rows, BuildOptions{Listen: ":8443", DisableAutoHTTPS: true})
+	if err != nil {
+		t.Fatalf("BuildServer dev: %v", err)
+	}
+	if listen := dev["listen"].([]string); len(listen) != 1 || listen[0] != ":8443" {
+		t.Errorf("dev listen = %v, want [:8443]", listen)
+	}
+	if ah, ok := dev["automatic_https"].(map[string]any); !ok || ah["disable"] != true {
+		t.Errorf("automatic_https = %v, want {disable: true}", dev["automatic_https"])
+	}
+	// The route content is identical: only the environment knobs differ.
+	if len(def["routes"].([]any)) != len(dev["routes"].([]any)) {
+		t.Error("dev options changed the route set")
+	}
+}
+
 func TestBuildServerRejectsBadRows(t *testing.T) {
 	if _, err := BuildServer([]store.RouteRow{
 		{DomainID: "d", AppID: "a", Hostname: "*.example.com", HostPort: 20017},
-	}, nil); err == nil {
+	}, BuildOptions{}); err == nil {
 		t.Error("wildcard hostname accepted; want rejection")
 	}
 	if _, err := BuildServer([]store.RouteRow{
 		{DomainID: "d1", AppID: "a", Hostname: "x.example.com", HostPort: 20017},
 		{DomainID: "d2", AppID: "a", Hostname: "x.example.com", HostPort: 20018},
-	}, nil); err == nil {
+	}, BuildOptions{}); err == nil {
 		t.Error("duplicate hostname accepted; want rejection")
 	}
 	if _, err := BuildServer([]store.RouteRow{
 		{DomainID: "d", AppID: "a", Hostname: "x.example.com", HostPort: 80},
-	}, nil); err == nil {
+	}, BuildOptions{}); err == nil {
 		t.Error("port outside managed range accepted; want rejection")
 	}
 	if _, err := BuildServer([]store.RouteRow{
 		{DomainID: "d", AppID: "a", Hostname: "x.example.com", HostPort: 20017},
-	}, &Override{AppID: "a", HostPort: policy.MinHostPort - 1}); err == nil {
+	}, BuildOptions{Override: &Override{AppID: "a", HostPort: policy.MinHostPort - 1}}); err == nil {
 		t.Error("override outside managed range accepted; want rejection")
 	}
 }
@@ -104,11 +139,11 @@ func TestHashDeterministicAndSensitive(t *testing.T) {
 	rows := []store.RouteRow{
 		{DomainID: "dom1", AppID: "appA", Hostname: "a.example.com", HostPort: 20017},
 	}
-	s1, err := BuildServer(rows, nil)
+	s1, err := BuildServer(rows, BuildOptions{})
 	if err != nil {
 		t.Fatalf("BuildServer: %v", err)
 	}
-	s2, err := BuildServer(rows, nil)
+	s2, err := BuildServer(rows, BuildOptions{})
 	if err != nil {
 		t.Fatalf("BuildServer 2: %v", err)
 	}
@@ -123,7 +158,7 @@ func TestHashDeterministicAndSensitive(t *testing.T) {
 
 	changed, err := BuildServer([]store.RouteRow{
 		{DomainID: "dom1", AppID: "appA", Hostname: "a.example.com", HostPort: 20018},
-	}, nil)
+	}, BuildOptions{})
 	if err != nil {
 		t.Fatalf("BuildServer changed: %v", err)
 	}
