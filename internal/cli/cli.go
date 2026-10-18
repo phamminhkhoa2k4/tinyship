@@ -45,6 +45,8 @@ func RunWithIO(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		return cmdStatus(ctx, args[1:], stdout, stderr)
 	case "budget":
 		return cmdBudget(ctx, args[1:], stdout, stderr)
+	case "keygen":
+		return cmdKeygen(ctx, args[1:], stdout, stderr)
 	case "help", "--help", "-h":
 		usage(stdout)
 		return 0
@@ -95,6 +97,7 @@ Commands:
   deployments   Show an app's deployment history
   status        Show API health and apps
   budget        Show or set the host RAM budget
+  keygen        Generate the secret encryption key pair
   version       Print binary, commit, and DB schema versions
   help          Show this help
 
