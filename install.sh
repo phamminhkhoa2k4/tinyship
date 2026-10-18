@@ -261,8 +261,43 @@ install_from_local() {
     write_caddy_baseline
     write_caddy_unit
 
+    bootstrap_token
+
     log "TinyShip's own systemd units and keys arrive later; not installed by this revision"
     log "install done; run: tinyship version"
+}
+
+# bootstrap_token issues the first admin token: it runs the database
+# migrations (creating the DB if absent) and writes the plaintext token to
+# /etc/tinyship/token (mode 0640). The value is printed once by the token
+# command; here it is suppressed so the log does not carry the credential.
+# A re-run is idempotent: an existing token file is never overwritten.
+bootstrap_token() {
+    local bin="$INSTALL_ROOT/usr/local/bin/tinyship"
+    local db="$INSTALL_ROOT/var/lib/tinyship/tinyship.db"
+    local tf="$INSTALL_ROOT/etc/tinyship/token"
+
+    if [[ -e "$tf" ]]; then
+        log "existing $tf kept (idempotent install)"
+        return 0
+    fi
+
+    log "issuing the first admin token (hash stored; plaintext written to $tf and shown once)"
+    if ! TINYSHIP_DB="$db" TINYSHIP_TOKEN_FILE="$tf" "$bin" token create >/dev/null 2>"$INSTALL_ROOT/token.err"; then
+        cat "$INSTALL_ROOT/token.err" >&2
+        rm -f "$INSTALL_ROOT/token.err"
+        fail "could not issue the admin token; run 'tinyship token create' after fixing the error"
+        return 1
+    fi
+    rm -f "$INSTALL_ROOT/token.err"
+    if ! sandbox; then
+        # The token command runs as root, so re-own the files it created:
+        # the DB must be writable by the services, the token readable by
+        # the admin group.
+        chown tinyship:tinyship-db "$db" "$db-wal" "$db-shm" 2>/dev/null || true
+        chown root:tinyship-admin "$tf" 2>/dev/null || true
+    fi
+    log "admin token created; keep the plaintext private (it is not recoverable from the database)"
 }
 
 # --------------------------------------------------------------------- main
