@@ -55,6 +55,7 @@ func fakeInstall(t *testing.T, root string) {
 		"etc/systemd/system/tinyship-api.service":          "[Unit]\n",
 		"etc/systemd/system/tinyship-worker.service":       "[Unit]\n",
 		"etc/systemd/system/caddy.service.d/tinyship.conf": "ExecStart=\n",
+		"etc/tmpfiles.d/tinyship.conf":                     "d /run/tinyship 0771 tinyship tinyship -\n",
 		"etc/caddy/caddy.json":                             "{}\n",
 		"usr/local/bin/tinyship":                           "binary\n",
 		"etc/tinyship/token":                               "tok\n",
@@ -97,6 +98,7 @@ func TestUninstallDefaultKeepsDataAndNeverTouchesDocker(t *testing.T) {
 		"etc/systemd/system/tinyship-api.service",
 		"etc/systemd/system/tinyship-worker.service",
 		"etc/systemd/system/caddy.service.d/tinyship.conf",
+		"etc/tmpfiles.d/tinyship.conf",
 		"usr/local/bin/tinyship",
 	} {
 		if present(filepath.Join(root, rel)) {
@@ -192,6 +194,7 @@ func TestUninstallPurgeYesRemovesOnlyWhatWasListed(t *testing.T) {
 		"etc/systemd/system/tinyship-api.service",
 		"etc/systemd/system/tinyship-worker.service",
 		"etc/systemd/system/caddy.service.d/tinyship.conf",
+		"etc/tmpfiles.d/tinyship.conf",
 		"usr/local/bin/tinyship",
 		"etc/tinyship",
 		"var/lib/tinyship",
@@ -317,5 +320,35 @@ func TestUninstallRejectsUnexpectedArguments(t *testing.T) {
 	code, _, _ := run(t, "uninstall", "--install-root", root, "extra")
 	if code != 2 {
 		t.Errorf("exit = %d, want 2 for an unexpected argument", code)
+	}
+}
+
+// TestUninstallRealHostPathsAreAbsolute pins the regression where an
+// empty install root was joined as a relative path: on a real host the
+// command would then have looked for (and "removed") paths relative to
+// the current directory, silently doing nothing.
+func TestUninstallRealHostPathsAreAbsolute(t *testing.T) {
+	units, dropin, tmpfiles, binary, baseline, etc, data, run := uninstallPaths("")
+	paths := append([]string{}, units...)
+	paths = append(paths, dropin, tmpfiles, binary, baseline, etc, data, run)
+	if len(paths) != 9 {
+		t.Fatalf("expected 9 paths, got %d", len(paths))
+	}
+	for _, p := range paths {
+		if !filepath.IsAbs(p) {
+			t.Errorf("real-host path %q is not absolute", p)
+		}
+	}
+	if binary != "/usr/local/bin/tinyship" || etc != "/etc/tinyship" {
+		t.Errorf("real-host layout wrong: binary=%q etc=%q", binary, etc)
+	}
+
+	// A sandbox root prefixes every path instead.
+	units2, _, _, binary2, _, etc2, _, _ := uninstallPaths("/sbx")
+	if len(units2) != 2 || units2[0] != "/sbx/etc/systemd/system/tinyship-api.service" {
+		t.Errorf("sandbox unit path wrong: %q", units2)
+	}
+	if binary2 != "/sbx/usr/local/bin/tinyship" || etc2 != "/sbx/etc/tinyship" {
+		t.Errorf("sandbox layout wrong: binary=%q etc=%q", binary2, etc2)
 	}
 }

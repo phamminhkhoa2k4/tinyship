@@ -38,6 +38,29 @@ func uninstallRoot(flagRoot string) string {
 	return os.Getenv("TINYSHIP_INSTALL_ROOT")
 }
 
+// uninstallPaths returns every path the command works with, rooted at
+// the install root. An empty root means the real host: joining it with
+// a relative element would yield a cwd-relative path (and a purge that
+// silently removes nothing), so the empty root becomes "/" here.
+func uninstallPaths(root string) (units []string, dropin, tmpfiles, binary, baseline, etc, data, run string) {
+	base := root
+	if base == "" {
+		base = "/"
+	}
+	units = []string{
+		filepath.Join(base, "etc/systemd/system/tinyship-api.service"),
+		filepath.Join(base, "etc/systemd/system/tinyship-worker.service"),
+	}
+	dropin = filepath.Join(base, "etc/systemd/system/caddy.service.d/tinyship.conf")
+	tmpfiles = filepath.Join(base, "etc/tmpfiles.d/tinyship.conf")
+	binary = filepath.Join(base, "usr/local/bin/tinyship")
+	baseline = filepath.Join(base, "etc/caddy/caddy.json")
+	etc = filepath.Join(base, "etc/tinyship")
+	data = filepath.Join(base, "var/lib/tinyship")
+	run = filepath.Join(base, "run/tinyship")
+	return units, dropin, tmpfiles, binary, baseline, etc, data, run
+}
+
 // runDocker runs the docker CLI and returns its stdout. Tests stub it
 // so the decision logic runs without a daemon.
 var runDocker = func(ctx context.Context, args ...string) ([]byte, error) {
@@ -152,16 +175,7 @@ so a later install resumes where this one stopped.
 		return 1
 	}
 
-	unitPaths := []string{
-		filepath.Join(root, "etc/systemd/system/tinyship-api.service"),
-		filepath.Join(root, "etc/systemd/system/tinyship-worker.service"),
-	}
-	dropinPath := filepath.Join(root, "etc/systemd/system/caddy.service.d/tinyship.conf")
-	binaryPath := filepath.Join(root, "usr/local/bin/tinyship")
-	baselinePath := filepath.Join(root, "etc/caddy/caddy.json")
-	etcPath := filepath.Join(root, "etc/tinyship")
-	dataPath := filepath.Join(root, "var/lib/tinyship")
-	runPath := filepath.Join(root, "run/tinyship")
+	unitPaths, dropinPath, tmpfilesPath, binaryPath, baselinePath, etcPath, dataPath, runPath := uninstallPaths(root)
 
 	if *purge {
 		containers, volumes, network, err := managedDocker(ctx)
@@ -200,11 +214,12 @@ so a later install resumes where this one stopped.
 
 	stopServices(ctx, realHost, stdout, stderr)
 
-	// Control plane on every run: units, the proxy drop-in, the binary.
-	// The binary is removed last so this process keeps running from the
-	// unlinked inode (Linux allows that; the kernel holds the code).
+	// Control plane on every run: units, the proxy drop-in, the tmpfiles
+	// snippet, the binary. The binary is removed last so this process
+	// keeps running from the unlinked inode (Linux allows that; the
+	// kernel holds the code).
 	kill := append([]string{}, unitPaths...)
-	kill = append(kill, dropinPath)
+	kill = append(kill, dropinPath, tmpfilesPath)
 	if *purge {
 		kill = append(kill, etcPath, dataPath, runPath, baselinePath)
 	}
@@ -311,6 +326,11 @@ func purgeIdentity(ctx context.Context, stderr io.Writer) {
 		{"groupdel", "tinyship"},
 	} {
 		if out, err := exec.CommandContext(ctx, cmd[0], cmd[1:]...).CombinedOutput(); err != nil {
+			// Already gone is the desired end state of a purge (and of a
+			// previous run), so it is not worth printing.
+			if strings.Contains(string(out), "does not exist") {
+				continue
+			}
 			fmt.Fprintf(stderr, "tinyship uninstall: %s skipped: %s\n",
 				strings.Join(cmd, " "), strings.TrimSpace(string(out)))
 		}
