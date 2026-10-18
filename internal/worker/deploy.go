@@ -40,6 +40,10 @@ type Docker interface {
 	InspectContainer(ctx context.Context, id string) (*docker.ContainerInfo, error)
 	ContainerLogs(ctx context.Context, id string, tail int, since time.Duration, follow bool) (io.ReadCloser, error)
 	ExecProbe(ctx context.Context, id string, command []string, timeout time.Duration) (int, error)
+	// ListManagedContainers enumerates every container carrying the
+	// managed label; app teardown finds its containers by app label
+	// even when database rows are already gone.
+	ListManagedContainers(ctx context.Context) ([]docker.ContainerInfo, error)
 }
 
 // Deployer runs the deploy pipeline for claimed deploy jobs.

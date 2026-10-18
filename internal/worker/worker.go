@@ -144,7 +144,9 @@ func Run(ctx context.Context, argv []string) int {
 	}
 
 	cfg.Handlers = map[string]Handler{
-		DeployJobType: dplr.Handler(),
+		DeployJobType:     dplr.Handler(),
+		AppDeleteJobType:  dplr.AppDeleteHandler(),
+		DomainSyncJobType: dplr.DomainSyncHandler(),
 	}
 	cfg.Caddy = cc
 	// Log socket: /run/tinyship/worker.sock by default;

@@ -62,6 +62,7 @@ type fakeDocker struct {
 	digest     string
 	createErr  error
 	startErr   error
+	removeErr  error
 	afterStart func(c *fakeContainer) // simulate a crashing entrypoint
 	logs       string
 	execCode   int
@@ -177,6 +178,9 @@ func (f *fakeDocker) StopContainer(_ context.Context, id string, grace time.Dura
 func (f *fakeDocker) RemoveContainer(_ context.Context, id string, _ bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.removeErr != nil {
+		return f.removeErr
+	}
 	c := f.lookup(id)
 	if c == nil {
 		return fmt.Errorf("Error response from daemon: No such container: %s", id)
@@ -214,6 +218,25 @@ func (f *fakeDocker) ExecProbe(_ context.Context, _ string, _ []string, _ time.D
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.execCode, f.execErr
+}
+
+func (f *fakeDocker) ListManagedContainers(context.Context) ([]docker.ContainerInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []docker.ContainerInfo
+	for _, c := range f.containers {
+		if c.labels[policy.LabelManaged] != policy.ManagedValue {
+			continue
+		}
+		labels := map[string]string{}
+		for k, v := range c.labels {
+			labels[k] = v
+		}
+		out = append(out, docker.ContainerInfo{
+			ID: c.id, Name: c.name, State: c.state, ExitCode: c.exit, Labels: labels,
+		})
+	}
+	return out, nil
 }
 
 func (f *fakeDocker) containerCount() int {
@@ -495,6 +518,9 @@ func (s *specCapture) ContainerLogs(ctx context.Context, id string, tail int, si
 }
 func (s *specCapture) ExecProbe(ctx context.Context, id string, cmd []string, timeout time.Duration) (int, error) {
 	return s.inner.ExecProbe(ctx, id, cmd, timeout)
+}
+func (s *specCapture) ListManagedContainers(ctx context.Context) ([]docker.ContainerInfo, error) {
+	return s.inner.ListManagedContainers(ctx)
 }
 
 // --- payload strictness ----------------------------------------------
