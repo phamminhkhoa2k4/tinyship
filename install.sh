@@ -5,7 +5,11 @@
 # - preflight is complete and non-destructive: supported OS,
 # available RAM, free disk, ports 80/443, Docker presence/version;
 # `--check-only` runs preflight and exits without changing anything.
-# - install supports `--from-local <path-to-binary>` (dev/self-host path).
+# - install supports `--from-local <path-to-binary>` (dev/self-host path)
+# and wires a working host: Docker Engine through apt when missing, the
+# two hardened systemd services (started now, restarted on boot), the
+# sealed-secret key pair, the host config file, the proxy baseline, and
+# the first admin token.
 # The download-from-release path (checksum verification)
 # activates once releases exist; until then the script refuses to guess
 # a download URL.
@@ -43,13 +47,20 @@ Usage: install.sh [options]
 
 Options:
   --check-only        Run preflight only; change nothing, exit non-zero on failure
-  --yes               Non-interactive mode (assume yes for prompts)
+  --yes               Non-interactive mode (assume yes for prompts, including
+                      the Docker install)
   --from-local PATH   Install the given locally built tinyship binary
   -h, --help          Show this help
 
 Environment:
   TINYSHIP_INSTALL_ROOT  Write under this prefix instead of / (dev/test only;
                          skips users, groups, services, and the port checks)
+
+What a full install does: preflight, Docker Engine via apt when missing
+(prompted unless --yes), the two systemd services with hardening and
+autostart on boot, the sealed-secret key pair, the host config file, the
+proxy baseline (when Caddy is present), the first admin token (shown
+once), then starts and health-checks the services.
 
 Supported hosts: Ubuntu 22.04/24.04, Debian 12, amd64,
 Docker Engine >= 24.0 (API >= 1.43), Caddy >= 2.0.
@@ -107,16 +118,24 @@ preflight() {
         log "preflight: free disk ${disk_mb} MiB (>= ${MIN_DISK_MB})"
     fi
 
- # 4. Ports 80/443 (Caddy needs them). A sandbox install root starts
- # no services, so nothing can conflict with them.
+ # 4. Ports 80/443 exist for the proxy. A sandbox install root starts
+ # no services, so nothing can conflict with them; without Caddy this
+ # install wires no proxy either, so a busy port is then a warning
+ # (it only blocks a later Caddy setup), not a failure.
     if sandbox; then
         log "preflight: sandbox install root set; port checks skipped (no services are started)"
     else
-        local port
+        local port caddy_here
+        caddy_here=0
+        [[ -n "$(resolve_caddy)" ]] && caddy_here=1
         for port in 80 443; do
             if listening_on "$port"; then
-                fail "port ${port} is already in use; Caddy cannot start (stop the service using it or reassign it)"
-                ok=1
+                if (( caddy_here )); then
+                    fail "port ${port} is already in use; Caddy cannot start (stop the service using it or reassign it)"
+                    ok=1
+                else
+                    warn "port ${port} is in use; no proxy runs in this install (Caddy absent), this only blocks a later Caddy setup"
+                fi
             else
                 log "preflight: port ${port} free"
             fi
@@ -162,6 +181,68 @@ listening_on() {
         hex=$(printf '%04X' "$port")
         grep -qE "^[[:space:]]*[0-9]+: [0-9A-F]{8,32}:${hex} " /proc/net/tcp /proc/net/tcp6 2>/dev/null
     fi
+}
+
+# confirm asks a yes/no question. --yes answers yes so non-interactive
+# runs work; a closed stdin or any other answer is no.
+confirm() {
+    if (( ASSUME_YES )); then
+        log "$1 yes (--yes)"
+        return 0
+    fi
+    if [[ ! -t 0 ]]; then
+        fail "$1 non-interactive run: re-run with --yes to approve"
+        return 1
+    fi
+    local answer
+    read -r -p "$1 [y/N] " answer
+    [[ "$answer" == "y" || "$answer" == "Y" || "$answer" == "yes" ]]
+}
+
+# ensure_docker installs Docker Engine from the vendor's apt repository
+# when it is missing: apt prerequisites, the vendor signing key, the
+# package repository, the engine packages, then the daemon. Sandbox
+# installs never touch host packages. Interactive runs confirm first;
+# non-interactive runs need --yes.
+ensure_docker() {
+    if sandbox; then
+        warn "sandbox mode: the host must provide Docker; not installing packages"
+        return 0
+    fi
+    log "Docker is not installed"
+    if ! confirm "Install Docker Engine from Docker's official apt repository now?"; then
+        fail "Docker is required; install Docker >= 24.0 yourself and re-run the installer"
+        return 1
+    fi
+
+    log "installing Docker Engine (apt)"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq \
+        || { fail "apt-get update failed; cannot install Docker"; return 1; }
+    apt-get install -y -qq ca-certificates curl \
+        || { fail "could not install apt prerequisites (ca-certificates, curl)"; return 1; }
+    install -d -m 0755 /etc/apt/keyrings
+    curl -fsSL "https://download.docker.com/linux/${ID}/gpg" -o /etc/apt/keyrings/docker.asc \
+        || { fail "could not download Docker's repository signing key"; return 1; }
+    chmod a+r /etc/apt/keyrings/docker.asc
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${ID} ${VERSION_CODENAME} stable" \
+        > /etc/apt/sources.list.d/docker.list \
+        || { fail "could not add Docker's apt repository"; return 1; }
+    apt-get update -qq \
+        || { fail "apt-get update with the Docker repository failed"; return 1; }
+    apt-get install -y -qq docker-ce docker-ce-cli containerd.io \
+        || { fail "Docker installation failed; install Docker >= 24.0 manually and re-run"; return 1; }
+    systemctl enable --now docker \
+        || { fail "Docker was installed but its service could not start (try: systemctl start docker)"; return 1; }
+
+    local api_version
+    api_version=$(docker version --format '{{.Server.APIVersion}}' 2>/dev/null || echo "unknown")
+    if [[ "$api_version" == "unknown" ]] \
+        || ! printf '%s\n%s\n' "$DOCKER_MIN_API" "$api_version" | sort -V -C; then
+        fail "Docker API ${api_version} does not meet the ${DOCKER_MIN_API} requirement after install"
+        return 1
+    fi
+    log "Docker Engine installed (API ${api_version})"
 }
 
 # ------------------------------------------------------------------ install
@@ -240,6 +321,19 @@ install_from_local() {
         # The worker reaches the proxy admin socket through this group.
         getent group caddy-admin >/dev/null 2>&1 || groupadd --system caddy-admin
         usermod -a -G caddy-admin tinyship-worker
+        # The worker drives containers through the Docker socket; on this
+        # platform membership in docker is equivalent to root (documented
+        # in the threat model, and the reason the worker is a separate
+        # user from the API).
+        if getent group docker >/dev/null 2>&1; then
+            usermod -a -G docker tinyship-worker
+        fi
+        # Whoever invoked sudo gets the admin group so the CLI can read
+        # the token file and reach the API socket afterwards.
+        if [[ -n "${SUDO_USER:-}" ]] && id "$SUDO_USER" >/dev/null 2>&1; then
+            usermod -a -G tinyship-admin "$SUDO_USER"
+            log "added $SUDO_USER to tinyship-admin (log out and back in for it to take effect)"
+        fi
     fi
 
     install -d -m 0755 "$INSTALL_ROOT/usr/local/bin"
@@ -254,17 +348,255 @@ install_from_local() {
         install -d -m 0750 "$INSTALL_ROOT/var/lib/tinyship"
         install -d -m 0750 "$INSTALL_ROOT/etc/tinyship"
     else
-        install -d -o tinyship -g tinyship-db -m 0770 "$INSTALL_ROOT/var/lib/tinyship"
-        install -d -o root -g tinyship -m 0640 "$INSTALL_ROOT/etc/tinyship" 2>/dev/null || true
+        # The setgid bit keeps SQLite's write-ahead log in the shared
+        # group even when the API or the worker is the process that
+        # creates it; both units run with UMask=0007 so such files land
+        # group-writable (0660) for the other service.
+        install -d -o tinyship -g tinyship-db -m 2770 "$INSTALL_ROOT/var/lib/tinyship"
+        # 0751: root writes, the services read via the tinyship group,
+        # and admin-group members can traverse to the token file without
+        # being able to list the directory.
+        install -d -o root -g tinyship -m 0751 "$INSTALL_ROOT/etc/tinyship"
     fi
 
+    write_keys
+    write_config
     write_caddy_baseline
     write_caddy_unit
+    write_tmpfiles
+    write_units
 
     bootstrap_token
 
-    log "TinyShip's own systemd units and keys arrive later; not installed by this revision"
-    log "install done; run: tinyship version"
+    start_services
+
+    log "install done; the admin token above was shown once — store it safely"
+    log "create your first app: tinyship app create --name web --image traefik/whoami --port 8080"
+}
+
+# write_keys generates the sealed-secret key pair on first install. The
+# pair is never regenerated: stored secrets encrypted for an old key
+# would become unreadable, so an existing pair is always kept.
+write_keys() {
+    local bin="$INSTALL_ROOT/usr/local/bin/tinyship"
+    local dir="$INSTALL_ROOT/etc/tinyship/keys"
+
+    if [[ -e "$dir/secrets.key" || -e "$dir/secrets.pub" ]]; then
+        log "existing sealed-secret key pair kept (idempotent install)"
+        return 0
+    fi
+    log "generating the sealed-secret key pair (private key readable by the worker only)"
+    if ! "$bin" keygen --keys-dir "$dir" >/dev/null; then
+        fail "key generation failed; run 'tinyship keygen' after fixing the error"
+        return 1
+    fi
+    if ! sandbox; then
+        chown root:tinyship "$dir" 2>/dev/null || true
+        chown root:tinyship "$dir/secrets.pub" 2>/dev/null || true
+        chown tinyship-worker "$dir/secrets.key" 2>/dev/null || true
+    fi
+    log "installed $dir (secrets.key 0400 worker-only, secrets.pub 0640)"
+}
+
+# write_config records the host configuration the services run with.
+# The services read these values from their own defaults and from the
+# database (budget), so the file documents the effective setup for the
+# operator; an existing file is never overwritten.
+write_config() {
+    local path="$INSTALL_ROOT/etc/tinyship/config.yaml"
+    if [[ -e "$path" ]]; then
+        log "existing $path kept (idempotent install)"
+        return 0
+    fi
+    cat >"$path" <<'EOF'
+# Host configuration, written by the TinyShip installer.
+# The services read these values from their own defaults; the host RAM
+# budget is applied with `tinyship budget set` and stored in the
+# database. This file records the effective configuration.
+host:
+  budget_mb: auto            # auto = min(50% MemTotal, MemTotal - 1024 MiB)
+  disk_guard_free_mb: 1024   # deploys refuse to start below this free space
+                             # on the filesystem holding /var/lib/docker
+api:
+  tcp_listen: 127.0.0.1:7878
+  unix_socket: /run/tinyship/api.sock
+worker:
+  unix_socket: /run/tinyship/worker.sock
+  host_port_range: 22500-22999
+caddy:
+  admin_socket: /run/caddy/admin.sock
+paths:
+  database: /var/lib/tinyship/tinyship.db
+  keys: /etc/tinyship/keys
+  token: /etc/tinyship/token
+EOF
+    chmod 0640 "$path"
+    if ! sandbox; then
+        chown root:tinyship "$path" 2>/dev/null || true
+    fi
+    log "installed $path (host configuration)"
+}
+
+# write_tmpfiles registers the shared run directory with
+# systemd-tmpfiles. A service's mount namespace is configured before
+# any of its commands run, so the directory named in ReadWritePaths has
+# to exist by then; tmpfiles creates it at boot (and once, here, right
+# after install). The directory belongs to neither unit, so stopping
+# one service never deletes the other's socket, and its shared group
+# lets both services create their sockets in it.
+write_tmpfiles() {
+    local path="$INSTALL_ROOT/etc/tmpfiles.d/tinyship.conf"
+    if [[ -e "$path" ]]; then
+        log "existing $path kept (idempotent install)"
+        return 0
+    fi
+    install -d -m 0755 "$(dirname "$path")"
+    printf 'd /run/tinyship 0771 tinyship tinyship -\n' >"$path"
+    chmod 0644 "$path"
+    log "installed $path (creates /run/tinyship at boot, mode 0771 shared group)"
+    if ! sandbox; then
+        systemd-tmpfiles --create "$path" \
+            || { fail "could not create /run/tinyship; run: systemd-tmpfiles --create $path"; return 1; }
+    fi
+}
+
+# write_units installs the two systemd services. The hardening set
+# (private tmp, read-only system files, no new privileges, bounded
+# address families and syscalls, memory guardrail, restart on failure)
+# follows the platform's documented minimum. The group wiring gives the
+# API the admin group so its socket is reachable by the CLI, and gives
+# the worker the docker, database and proxy-admin groups. WantedBy
+# makes both come back after a reboot. An existing unit is never
+# overwritten.
+write_units() {
+    local api_unit="$INSTALL_ROOT/etc/systemd/system/tinyship-api.service"
+    local worker_unit="$INSTALL_ROOT/etc/systemd/system/tinyship-worker.service"
+
+    if [[ -e "$api_unit" || -e "$worker_unit" ]]; then
+        log "existing systemd units kept (idempotent install)"
+    else
+        install -d -m 0755 "$(dirname "$api_unit")"
+        cat >"$api_unit" <<'EOF'
+[Unit]
+Description=TinyShip API server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tinyship
+Group=tinyship-admin
+SupplementaryGroups=tinyship tinyship-db
+Environment=TINYSHIP_DB=/var/lib/tinyship/tinyship.db
+Environment=TINYSHIP_RUN_DIR=/run/tinyship
+Environment=TINYSHIP_SECRETS_PUB=/etc/tinyship/keys/secrets.pub
+ExecStart=/usr/local/bin/tinyship api
+Restart=on-failure
+RestartSec=5s
+UMask=0007
+
+# Hardening: the API needs the database, the run directory, and
+# nothing else on the filesystem.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/tinyship /run/tinyship
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET
+SystemCallFilter=@system-service
+MemoryDenyWriteExecute=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+OOMScoreAdjust=-500
+MemoryMax=200M
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        cat >"$worker_unit" <<'EOF'
+[Unit]
+Description=TinyShip job worker
+After=network-online.target docker.service caddy.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+User=tinyship-worker
+Group=tinyship
+SupplementaryGroups=docker tinyship-db caddy-admin
+Environment=TINYSHIP_DB=/var/lib/tinyship/tinyship.db
+Environment=TINYSHIP_RUN_DIR=/run/tinyship
+Environment=TINYSHIP_SECRETS_KEY=/etc/tinyship/keys/secrets.key
+ExecStart=/usr/local/bin/tinyship worker
+Restart=on-failure
+RestartSec=5s
+UMask=0007
+
+# Hardening: the worker is the most privileged component (it holds the
+# docker group), so it gets the same filesystem and syscall limits; the
+# Docker and proxy sockets stay reachable through group membership.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/tinyship /run/tinyship
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+MemoryDenyWriteExecute=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+OOMScoreAdjust=-500
+MemoryMax=200M
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        chmod 0644 "$api_unit" "$worker_unit"
+        log "installed $api_unit and $worker_unit"
+    fi
+
+    if ! sandbox; then
+        systemctl daemon-reload \
+            || { fail "systemd could not load the new units; run: systemctl daemon-reload"; return 1; }
+    fi
+}
+
+# start_services enables both units, starts them, and waits briefly for
+# them to report active; a failure prints the journal tail so the
+# operator sees why immediately. Sandbox installs start nothing.
+start_services() {
+    if sandbox; then
+        log "sandbox mode: services not enabled or started"
+        return 0
+    fi
+    log "enabling and starting tinyship-api and tinyship-worker"
+    systemctl enable --now tinyship-api tinyship-worker \
+        || { fail "services could not be started; see: journalctl -u tinyship-api -u tinyship-worker"; return 1; }
+    local i active=""
+    for i in $(seq 1 15); do
+        if systemctl is-active --quiet tinyship-api && systemctl is-active --quiet tinyship-worker; then
+            active=1
+            break
+        fi
+        sleep 1
+    done
+    if [[ -z "$active" ]]; then
+        journalctl -u tinyship-api -u tinyship-worker -n 20 --no-pager >&2 || true
+        fail "services did not become active; see the log above"
+        return 1
+    fi
+    log "both services active"
+    # The proxy is managed by the operator: reload it only if it is
+    # already running so the drop-in takes effect without forcing a
+    # start the operator did not ask for.
+    if [[ -n "$(resolve_caddy)" ]] && systemctl is-active --quiet caddy; then
+        systemctl try-restart caddy \
+            || warn "caddy is running but could not be restarted; run: systemctl restart caddy"
+    fi
 }
 
 # bootstrap_token issues the first admin token: it runs the database
@@ -330,8 +662,11 @@ if [[ -z "$FROM_LOCAL" ]]; then
     exit 2
 fi
 
-if ! command -v docker >/dev/null 2>&1 && (( ! ASSUME_YES )); then
-    fail "Docker is not installed; re-run with --yes to acknowledge, or install Docker >= 24.0 yourself"
+if ! command -v docker >/dev/null 2>&1; then
+    ensure_docker || exit 1
+fi
+if ! command -v docker >/dev/null 2>&1; then
+    fail "Docker is not available; install Docker >= 24.0 and re-run the installer"
     exit 1
 fi
 
