@@ -20,6 +20,7 @@ import (
 	"github.com/tinyship/tinyship/internal/appconfig"
 	"github.com/tinyship/tinyship/internal/docker"
 	"github.com/tinyship/tinyship/internal/policy"
+	"github.com/tinyship/tinyship/internal/secrypto"
 	"github.com/tinyship/tinyship/internal/store"
 )
 
@@ -49,6 +50,9 @@ type fakeDocker struct {
 	stopGrace time.Duration
 
 	lastPullRef string
+	// lastPullAuth is the credential the pipeline handed the daemon;
+	// tests assert it (and that no token ever reaches logs).
+	lastPullAuth *docker.Auth
 
 	logTail   int // last ContainerLogs arguments, for assertions
 	logSince  time.Duration
@@ -90,11 +94,12 @@ func (f *fakeDocker) lookup(key string) *fakeContainer {
 	return nil
 }
 
-func (f *fakeDocker) PullImage(_ context.Context, ref string, _ *docker.Auth) (string, error) {
+func (f *fakeDocker) PullImage(_ context.Context, ref string, auth *docker.Auth) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pulls++
 	f.lastPullRef = ref
+	f.lastPullAuth = auth
 	if f.pullErr != nil {
 		return "", f.pullErr
 	}
@@ -777,9 +782,9 @@ func TestDeployReusesContainerWithMatchingConfigHash(t *testing.T) {
 	}
 }
 
-// --- registry credential not supported ----------------------------------
+// --- registry credential and sealed env ---------------------------------
 
-func TestDeployRegistryCredentialRejectedAtValidate(t *testing.T) {
+func TestDeployMissingRegistryCredentialFailsValidate(t *testing.T) {
 	f := newDeployFixture(t, `{
 	"name": "web", "image": "ghcr.io/acme/app", "tag": "v1", "port": 8080,
 	"registry_credential": "acme-registry",
@@ -789,19 +794,82 @@ func TestDeployRegistryCredentialRejectedAtValidate(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected failure")
 	}
-	if Retryable(err) || !strings.Contains(err.Error(), "E_REGISTRY_AUTH") {
-		t.Errorf("err = %v, want permanent E_REGISTRY_AUTH", err)
+	if Retryable(err) || !strings.Contains(err.Error(), "E_VALIDATION") {
+		t.Errorf("err = %v, want permanent E_VALIDATION", err)
 	}
 	if f.fk.pulls != 0 {
-		t.Error("pull must not run when credentials are unsupported")
+		t.Error("pull must not run when the credential does not exist")
 	}
 	d := f.deployment()
-	if d.State != store.DepFailed || *d.FailureStep != "validate" || *d.FailureCode != "E_REGISTRY_AUTH" {
+	if d.State != store.DepFailed || *d.FailureStep != "validate" || *d.FailureCode != "E_VALIDATION" {
 		t.Errorf("deployment = %q/%v/%v", d.State, d.FailureStep, d.FailureCode)
 	}
 }
 
-func TestDeploySealedEnvRejectedAtValidate(t *testing.T) {
+// giveCredential stores a sealed credential and points the deployer's
+// key material at the pair that sealed it.
+func giveCredential(t *testing.T, f *deployFixture, name, registry, username, token string) {
+	t.Helper()
+	priv, pub, err := secrypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	sealed, err := secrypto.Seal(pub, []byte(token))
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	if _, err := f.s.UpsertCredential(f.ctx, name, registry, username, sealed); err != nil {
+		t.Fatalf("upsert credential: %v", err)
+	}
+	f.dplr.SecretKey = priv
+}
+
+func TestDeployPullUsesRegistryCredential(t *testing.T) {
+	f := newDeployFixture(t, `{
+	"name": "web", "image": "ghcr.io/acme/app", "tag": "v1", "port": 8080,
+	"registry_credential": "acme-registry",
+	`+execHealthFast+`
+}`)
+	giveCredential(t, f, "acme-registry", "ghcr.io", "linh", "tok_secret_value")
+
+	if err := f.run(1, 5); err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	auth := f.fk.lastPullAuth
+	if auth == nil {
+		t.Fatal("pull received no credentials")
+	}
+	if auth.Username != "linh" || auth.Secret != "tok_secret_value" {
+		t.Errorf("auth = %+v, want linh with the decrypted token", auth)
+	}
+	if auth.Registry != "ghcr.io" {
+		t.Errorf("auth.Registry = %q, want ghcr.io", auth.Registry)
+	}
+}
+
+func TestDeployWrongRegistryTokenFailsWithoutRetry(t *testing.T) {
+	f := newDeployFixture(t, `{
+	"name": "web", "image": "ghcr.io/acme/app", "tag": "v1", "port": 8080,
+	"registry_credential": "acme-registry",
+	`+execHealthFast+`
+}`)
+	giveCredential(t, f, "acme-registry", "ghcr.io", "linh", "expired-token")
+	f.fk.pullErr = errors.New("unauthorized: authentication required")
+
+	err := f.run(5, 5)
+	if err == nil {
+		t.Fatal("expected failure")
+	}
+	if Retryable(err) || !strings.Contains(err.Error(), "E_REGISTRY_AUTH") {
+		t.Errorf("err = %v, want permanent E_REGISTRY_AUTH", err)
+	}
+	d := f.deployment()
+	if d.State != store.DepFailed || *d.FailureStep != "pull" || *d.FailureCode != "E_REGISTRY_AUTH" {
+		t.Errorf("deployment = %q/%v/%v", d.State, d.FailureStep, d.FailureCode)
+	}
+}
+
+func TestDeploySealedEnvWithoutKeyFailsValidate(t *testing.T) {
 	f := newDeployFixture(t, happyConfig)
 	now := time.Now().UTC().UnixMilli()
 	if _, err := f.s.DB().Exec(
@@ -810,11 +878,57 @@ func TestDeploySealedEnvRejectedAtValidate(t *testing.T) {
 		t.Fatal(err)
 	}
 	err := f.run(1, 5)
-	if err == nil || !strings.Contains(err.Error(), "E_SECRETS_UNSUPPORTED") {
-		t.Fatalf("err = %v, want E_SECRETS_UNSUPPORTED", err)
+	if err == nil || !strings.Contains(err.Error(), "E_SECRETS_KEY") {
+		t.Fatalf("err = %v, want E_SECRETS_KEY", err)
 	}
 	if d := f.deployment(); d.State != store.DepFailed || *d.FailureStep != "validate" {
 		t.Errorf("deployment = %q/%v", d.State, d.FailureStep)
+	}
+}
+
+func TestDeploySealedEnvDecryptsIntoContainer(t *testing.T) {
+	f := newDeployFixture(t, happyConfig)
+	priv, pub, err := secrypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	sealed, err := secrypto.Seal(pub, []byte("decrypted-token"))
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	f.dplr.SecretKey = priv
+	now := time.Now().UTC().UnixMilli()
+	if _, err := f.s.DB().Exec(
+		`INSERT INTO app_env (app_id, key, kind, value_sealed, updated_at) VALUES (?, 'TOKEN', 'secret', ?, ?)`,
+		f.app.ID, sealed, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.DB().Exec(
+		`INSERT INTO app_env (app_id, key, kind, value_plain, updated_at) VALUES (?, 'MODE', 'plain', 'prod', ?)`,
+		f.app.ID, now); err != nil {
+		t.Fatal(err)
+	}
+
+	var captured []string
+	f.dplr.Docker = &specCapture{inner: f.fk, onCreate: func(env []string) {
+		captured = append(captured, env...)
+	}}
+	if err := f.run(1, 5); err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	want := map[string]string{"TOKEN": "decrypted-token", "MODE": "prod"}
+	for _, kv := range captured {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok || want[k] == "" {
+			continue
+		}
+		if v != want[k] {
+			t.Errorf("env %s = %q, want %q", k, v, want[k])
+		}
+		delete(want, k)
+	}
+	if len(want) != 0 {
+		t.Errorf("container env missing %v (got %v)", want, captured)
 	}
 }
 

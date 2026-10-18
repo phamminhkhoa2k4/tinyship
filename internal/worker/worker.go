@@ -18,6 +18,7 @@ import (
 
 	"github.com/tinyship/tinyship/internal/caddy"
 	"github.com/tinyship/tinyship/internal/docker"
+	"github.com/tinyship/tinyship/internal/secrypto"
 	"github.com/tinyship/tinyship/internal/store"
 )
 
@@ -28,6 +29,11 @@ const DefaultDBPath = "/var/lib/tinyship/tinyship.db"
 // DefaultRunDir holds the worker's log socket on an installed host.
 // TINYSHIP_RUN_DIR overrides it.
 const DefaultRunDir = "/run/tinyship"
+
+// DefaultSecretsKey is the worker's private key for sealed values on
+// an installed host. TINYSHIP_SECRETS_KEY overrides it (the API seals
+// with the matching secrets.pub in the same directory).
+const DefaultSecretsKey = "/etc/tinyship/keys/secrets.key"
 
 // Handler executes one claimed job. Returning nil marks the job succeeded;
 // returning a *RetryableError requeues with backoff; anything else fails the
@@ -117,6 +123,26 @@ func Run(ctx context.Context, argv []string) int {
 	cc := caddy.NewClient(envOr("TINYSHIP_CADDY_ADMIN", caddy.DefaultSocket))
 	dplr := NewDeployer(s, dw, logger, cfg.WorkerID)
 	dplr.Caddy = cc
+
+	// Sealed secrets need the private key. Absent is fine: public
+	// deploys run without it and secret-bearing ones fail at validate
+	// with a clear message. Present but unreadable or malformed is not
+	// fine: the key is the security boundary, so a broken one stops
+	// the worker instead of quietly degrading every deploy.
+	keyPath := envOr("TINYSHIP_SECRETS_KEY", DefaultSecretsKey)
+	key, err := secrypto.LoadPrivateKey(keyPath)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		logger.Info("worker: no private key; deploys with sealed values will fail",
+			"path", keyPath)
+	case err != nil:
+		logger.Error("worker: secret key unusable", "path", keyPath, "err", err)
+		return 1
+	default:
+		dplr.SecretKey = key
+		logger.Info("worker: private key loaded", "path", keyPath)
+	}
+
 	cfg.Handlers = map[string]Handler{
 		DeployJobType: dplr.Handler(),
 	}

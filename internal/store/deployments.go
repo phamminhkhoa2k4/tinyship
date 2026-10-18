@@ -510,30 +510,3 @@ func (s *Store) CountAuditEvents(ctx context.Context, action, targetID string) (
 	}
 	return n, nil
 }
-
-// ListAppEnvPlain returns the app's non-secret environment variables.
-// Sealed secrets need worker key material this path does not have, so
-// they are rejected here rather than silently dropped: env must come
-// from this store, and half an environment is a footgun.
-func (s *Store) ListAppEnvPlain(ctx context.Context, appID string) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT kind, key, value_plain FROM app_env WHERE app_id = ? ORDER BY key`, appID)
-	if err != nil {
-		return nil, fmt.Errorf("store: list app env: %w", err)
-	}
-	defer rows.Close()
-	var out []string
-	for rows.Next() {
-		var kind, key string
-		var plain sql.NullString
-		if err := rows.Scan(&kind, &key, &plain); err != nil {
-			return nil, err
-		}
-		if kind == "secret" {
-			return nil, fmt.Errorf("E_SECRETS_UNSUPPORTED: app_env %q is sealed; "+
-				"sealed secrets need worker key material this version does not have", key)
-		}
-		out = append(out, key+"="+plain.String)
-	}
-	return out, rows.Err()
-}

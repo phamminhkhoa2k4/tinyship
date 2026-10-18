@@ -333,34 +333,8 @@ func TestAuditIsAppendOnly(t *testing.T) {
 }
 
 // --- app env ---------------------------------------------------
-
-func TestListAppEnvPlain(t *testing.T) {
-	ctx := context.Background()
-	s := openTest(t)
-	appID := createApp(t, s, "web")
-
-	now := time.Now().UTC().UnixMilli()
-	if _, err := s.db.Exec(
-		`INSERT INTO app_env (app_id, key, kind, value_plain, updated_at) VALUES (?, 'MODE', 'plain', 'prod', ?)`,
-		appID, now); err != nil {
-		t.Fatalf("insert plain: %v", err)
-	}
-	env, err := s.ListAppEnvPlain(ctx, appID)
-	if err != nil || len(env) != 1 || env[0] != "MODE=prod" {
-		t.Errorf("env = %v, %v", env, err)
-	}
-
-	// A sealed secret must surface as an explicit error, not silent omission.
-	if _, err := s.db.Exec(
-		`INSERT INTO app_env (app_id, key, kind, value_sealed, updated_at) VALUES (?, 'TOKEN', 'secret', ?, ?)`,
-		appID, []byte("ciphertext"), now); err != nil {
-		t.Fatalf("insert secret: %v", err)
-	}
-	if _, err := s.ListAppEnvPlain(ctx, appID); err == nil ||
-		!strings.Contains(err.Error(), "E_SECRETS_UNSUPPORTED") {
-		t.Errorf("secret env = %v, want E_SECRETS_UNSUPPORTED", err)
-	}
-}
+// Env coverage lives with the env store tests: round trip, kind
+// switching, and mismatched payload rejection.
 
 // --- active domains ------------------
 

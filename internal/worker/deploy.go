@@ -14,6 +14,7 @@ import (
 	"github.com/tinyship/tinyship/internal/docker"
 	"github.com/tinyship/tinyship/internal/health"
 	"github.com/tinyship/tinyship/internal/policy"
+	"github.com/tinyship/tinyship/internal/secrypto"
 	"github.com/tinyship/tinyship/internal/store"
 )
 
@@ -48,6 +49,11 @@ type Deployer struct {
 	Logger            *slog.Logger
 	Actor             string // audit actor (worker id)
 	HealthConsecutive int    // default HealthConsecutivePasses
+	// SecretKey opens sealed env values and registry tokens. Nil means
+	// no key material: deploys that need a secret fail at validate
+	// with a clear error instead of starting a container with a
+	// half-built environment.
+	SecretKey []byte
 	// Caddy applies generated proxy config; nil means no route engine
 	// is configured and an app with active domains fails loudly.
 	Caddy Caddy
@@ -119,7 +125,7 @@ func asStepError(err error) *stepError {
 }
 
 // codeOf extracts an E_* prefix from well-formed store errors (e.g.
-// E_SECRETS_UNSUPPORTED, E_NO_FREE_PORT), falling back to fallback.
+// E_NO_FREE_PORT), falling back to fallback.
 func codeOf(err error, fallback string) string {
 	msg := err.Error()
 	if i := strings.Index(msg, ":"); i > 0 && strings.HasPrefix(msg[:i], "E_") {
@@ -155,6 +161,7 @@ type deployRun struct {
 
 	cfg            *appconfig.Config
 	env            []string
+	auth           *docker.Auth // decrypted registry login for this run; never logged
 	imageRef       string
 	digest         string
 	hostPort       int
@@ -329,6 +336,24 @@ func (p *Deployer) skip(ctx context.Context, d *deployRun, name string, detail a
 
 // --- steps ------------------------------------------------------------------
 
+// openSecret decrypts a sealed value with the worker's private key.
+// A missing or wrong key fails the run permanently: retrying cannot
+// conjure key material, and starting a container without the secret
+// would be worse than not starting it.
+func (p *Deployer) openSecret(sealed []byte, what string) ([]byte, error) {
+	if len(p.SecretKey) == 0 {
+		return nil, &pipelineError{code: "E_SECRETS_KEY", err: fmt.Errorf(
+			"%s is sealed but the worker has no private key configured "+
+				"(generate one with `tinyship keygen`)", what)}
+	}
+	plain, err := secrypto.Open(p.SecretKey, sealed)
+	if err != nil {
+		return nil, &pipelineError{code: "E_SECRETS_KEY", err: fmt.Errorf(
+			"%s: %w", what, err)}
+	}
+	return plain, nil
+}
+
 // stepValidate re-reads and revalidates everything from the database:
 // app config, env store, image reference, effective strategy, and
 // the previous container to replace. A rollback revalidates the target
@@ -350,14 +375,42 @@ func (p *Deployer) stepValidate(ctx context.Context, d *deployRun) (any, error) 
 	}
 	d.cfg = cfg
 
+	// Credential existence is a config problem; the token itself is
+	// opened here and lives only in memory for this run.
+	d.auth = nil
 	if cfg.RegistryCredential != "" {
-		return nil, &pipelineError{code: "E_REGISTRY_AUTH",
-			err: fmt.Errorf("registry credential %q: private registry authentication "+
-				"is not implemented in this release", cfg.RegistryCredential)}
+		cred, err := p.Store.GetCredential(ctx, cfg.RegistryCredential)
+		if err != nil {
+			return nil, &pipelineError{code: "E_VALIDATION", err: fmt.Errorf(
+				"registry_credential %q: %w (create it with `tinyship credential set`)",
+				cfg.RegistryCredential, err)}
+		}
+		token, err := p.openSecret(cred.SecretSealed, "registry credential "+cred.Name)
+		if err != nil {
+			return nil, err
+		}
+		d.auth = &docker.Auth{
+			Registry: cred.Registry,
+			Username: cred.Username,
+			Secret:   string(token),
+		}
 	}
-	env, err := p.Store.ListAppEnvPlain(ctx, d.app.ID)
+
+	vars, err := p.Store.ListAppEnv(ctx, d.app.ID)
 	if err != nil {
-		return nil, &pipelineError{code: codeOf(err, "E_VALIDATION"), err: err}
+		return nil, &RetryableError{err}
+	}
+	env := make([]string, 0, len(vars))
+	for _, v := range vars {
+		if v.Kind == store.EnvPlain {
+			env = append(env, v.Key+"="+v.ValuePlain)
+			continue
+		}
+		plain, err := p.openSecret(v.ValueSealed, "env "+v.Key)
+		if err != nil {
+			return nil, err
+		}
+		env = append(env, v.Key+"="+string(plain))
 	}
 	d.env = env
 
@@ -568,7 +621,7 @@ func (p *Deployer) numCPUs() int {
 // stepPull pulls the image and pins the digest. Network and 5xx
 // errors retry; "not found"/auth failures fail the job immediately
 func (p *Deployer) stepPull(ctx context.Context, d *deployRun, log *slog.Logger) (any, error) {
-	digest, err := p.Docker.PullImage(ctx, d.imageRef, nil)
+	digest, err := p.Docker.PullImage(ctx, d.imageRef, d.auth)
 	if err != nil {
 		switch lower := strings.ToLower(err.Error()); {
 		case strings.Contains(lower, "unauthorized"),
