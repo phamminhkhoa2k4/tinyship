@@ -18,6 +18,9 @@ import (
 // Store wraps a *sql.DB holding TinyShip state.
 type Store struct {
 	db *sql.DB
+	// argon is the argon2id cost used when hashing admin tokens. A
+	// zero value means the store defaults to DefaultArgonParams.
+	argon ArgonParams
 }
 
 // Open opens (creating if absent) the database at path with required PRAGMAs
