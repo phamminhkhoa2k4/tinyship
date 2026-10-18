@@ -12,6 +12,8 @@
 //	POST /apps/{name}/deploy queue a deploy job (202)
 //	GET /apps/{name}/deployments deployment history
 //	GET /deployments/{id} one deployment with its timeline
+//	DELETE /apps/{name} queue app teardown (202)
+//	DELETE /apps/{name}/domains/{hostname} detach a hostname (202)
 //	GET /apps/{name}/logs stream container logs via the worker
 //	POST /apps/{name}/domains attach a hostname (DNS-checked)
 //	GET /apps/{name}/domains list an app's domains
@@ -231,6 +233,8 @@ func newMuxWith(s *store.Store, runDir string, logger *slog.Logger, resolve Reso
 	mux.HandleFunc("GET /credentials", srv.handleListCredentials)
 	mux.HandleFunc("DELETE /credentials/{name}", srv.handleDeleteCredential)
 	mux.HandleFunc("GET /deployments/{id}", srv.handleShowDeployment)
+	mux.HandleFunc("DELETE /apps/{name}", srv.handleDeleteApp)
+	mux.HandleFunc("DELETE /apps/{name}/domains/{hostname}", srv.handleDeleteDomain)
 	return mux
 }
 
