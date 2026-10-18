@@ -108,7 +108,7 @@ func (s *server) handleSetBudget(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "E_VALIDATION", err.Error())
 		return
 	}
-	if err := s.store.AppendAudit(r.Context(), "api", "budget.set", "host", "",
+	if err := s.store.AppendAudit(r.Context(), actorName(r), "budget.set", "host", "",
 		"ok", map[string]any{"budget_mb": *body.BudgetMB}); err != nil {
 		s.logger.Error("audit budget.set", "err", err)
 	}

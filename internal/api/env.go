@@ -122,7 +122,7 @@ func (s *server) handleSetEnv(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The audit detail carries the key and kind, never the value.
-	_ = s.store.AppendAudit(r.Context(), "api", "env.set", "app", app.ID,
+	_ = s.store.AppendAudit(r.Context(), actorName(r), "env.set", "app", app.ID,
 		"ok", map[string]any{"key": key, "kind": kind})
 
 	detail := "takes effect on the next deploy"
@@ -150,7 +150,7 @@ func (s *server) handleUnsetEnv(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "E_INTERNAL", err.Error())
 		return
 	}
-	_ = s.store.AppendAudit(r.Context(), "api", "env.unset", "app", app.ID,
+	_ = s.store.AppendAudit(r.Context(), actorName(r), "env.unset", "app", app.ID,
 		"ok", map[string]any{"key": key})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"key": key, "message": "takes effect on the next deploy",

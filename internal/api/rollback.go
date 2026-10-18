@@ -108,7 +108,7 @@ func (s *server) handleRollback(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "E_INTERNAL", err.Error())
 		return
 	}
-	if err := s.store.AppendAudit(r.Context(), "api", "rollback", "deployment", dep.ID,
+	if err := s.store.AppendAudit(r.Context(), actorName(r), "rollback", "deployment", dep.ID,
 		"queued", map[string]any{
 			"app": name, "rollback_of": target.ID, "rollback_of_seq": target.Seq,
 		}); err != nil {

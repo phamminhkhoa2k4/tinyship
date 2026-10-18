@@ -79,7 +79,7 @@ func (s *server) handleCreateCredential(w http.ResponseWriter, r *http.Request) 
 	}
 	// Rotate and create share one action; the detail names what changed
 	// and never the token.
-	_ = s.store.AppendAudit(r.Context(), "api", "credential.set", "credential", cred.ID,
+	_ = s.store.AppendAudit(r.Context(), actorName(r), "credential.set", "credential", cred.ID,
 		"ok", map[string]any{"name": name, "registry": cred.Registry})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"credential": credentialDTO{
@@ -123,7 +123,7 @@ func (s *server) handleDeleteCredential(w http.ResponseWriter, r *http.Request) 
 		}
 		return
 	}
-	_ = s.store.AppendAudit(r.Context(), "api", "credential.delete", "credential", "",
+	_ = s.store.AppendAudit(r.Context(), actorName(r), "credential.delete", "credential", "",
 		"ok", map[string]any{"name": name})
 	writeJSON(w, http.StatusOK, map[string]any{"name": name, "deleted": true})
 }

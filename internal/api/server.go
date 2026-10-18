@@ -24,8 +24,10 @@
 //	GET /credentials list registry logins (no tokens)
 //	DELETE /credentials/{name} remove an unreferenced login
 //
-// There is no authentication yet; the mitigation
-// is the loopback-only bind plus filesystem permissions on the Unix socket
+// Every route except GET /healthz requires an admin bearer token
+// (see auth.go); the CLI reads its token from a system file.
+// The loopback bind plus filesystem permissions on the Unix socket
+// complement, not replace, that authentication.
 package api
 
 import (
@@ -83,7 +85,9 @@ func Run(ctx context.Context, argv []string) int {
 	}
 	defer s.Close()
 
-	handler := newMux(s, runDir, logger)
+	handler := newMuxWith(s, runDir, logger, func(ctx context.Context, hostname string) ([]net.IP, error) {
+		return net.DefaultResolver.LookupIP(ctx, "ip", hostname)
+	}, s)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -180,18 +184,26 @@ type server struct {
 	// write and kept for the process lifetime.
 	pubKey     []byte
 	pubKeyPath string
+	// auth, when set, enables bearer-token authentication on every route
+	// except the process-health check. nil disables it (tests, dev paths).
+	auth tokenVerifier
+	// limiter throttles bad-token attempts when auth is enabled.
+	limiter *authLimiter
 }
 
 // newMux builds the route table. Exported behavior for tests via httptest.
+// It keeps authentication disabled so handler unit tests do not each need a
+// token; the production run path uses newMuxWith with the store as auther.
 func newMux(s *store.Store, runDir string, logger *slog.Logger) http.Handler {
 	return newMuxWith(s, runDir, logger, func(ctx context.Context, hostname string) ([]net.IP, error) {
 		return net.DefaultResolver.LookupIP(ctx, "ip", hostname)
-	})
+	}, nil)
 }
 
-// newMuxWith is newMux with an explicit DNS resolver, so domain-attach
-// tests script resolution outcomes without touching the network.
-func newMuxWith(s *store.Store, runDir string, logger *slog.Logger, resolve Resolver) http.Handler {
+// newMuxWith is newMux with an explicit DNS resolver (so domain-attach
+// tests script resolution outcomes) and an explicit authenticator (nil
+// disables auth, as in handler unit tests). Production passes the store.
+func newMuxWith(s *store.Store, runDir string, logger *slog.Logger, resolve Resolver, auth tokenVerifier) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -200,6 +212,8 @@ func newMuxWith(s *store.Store, runDir string, logger *slog.Logger, resolve Reso
 		logger:  logger,
 		runDir:  runDir,
 		resolve: resolve,
+		auth:    auth,
+		limiter: newAuthLimiter(),
 		pubKeyPath: envOr("TINYSHIP_SECRETS_PUB",
 			filepath.Join("/etc/tinyship/keys", "secrets.pub")),
 		workerClient: &http.Client{
@@ -235,6 +249,9 @@ func newMuxWith(s *store.Store, runDir string, logger *slog.Logger, resolve Reso
 	mux.HandleFunc("GET /deployments/{id}", srv.handleShowDeployment)
 	mux.HandleFunc("DELETE /apps/{name}", srv.handleDeleteApp)
 	mux.HandleFunc("DELETE /apps/{name}/domains/{hostname}", srv.handleDeleteDomain)
+	if auth != nil {
+		return srv.authMiddleware(mux)
+	}
 	return mux
 }
 
@@ -393,7 +410,7 @@ func (s *server) handleCreateApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	app, err := s.store.CreateApp(r.Context(), store.CreateAppInput{
-		Name: cfg.Name, ConfigJSON: string(raw), Actor: "api",
+		Name: cfg.Name, ConfigJSON: string(raw), Actor: actorName(r),
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrAppNameExists) {

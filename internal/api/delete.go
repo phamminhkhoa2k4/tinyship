@@ -50,7 +50,7 @@ func (s *server) handleDeleteApp(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "E_INTERNAL", err.Error())
 		return
 	}
-	_ = s.store.AppendAudit(r.Context(), "api", "app.delete", "app", app.ID,
+	_ = s.store.AppendAudit(r.Context(), actorName(r), "app.delete", "app", app.ID,
 		"queued", map[string]any{"job_id": job.ID})
 
 	writeJSON(w, http.StatusAccepted, map[string]any{
@@ -101,7 +101,7 @@ func (s *server) handleDeleteDomain(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("domain removed but route sync could not be queued: %v", err))
 		return
 	}
-	_ = s.store.AppendAudit(r.Context(), "api", "domain.delete", "app", app.ID,
+	_ = s.store.AppendAudit(r.Context(), actorName(r), "domain.delete", "app", app.ID,
 		"ok", map[string]any{"hostname": hostname, "job_id": job.ID})
 
 	writeJSON(w, http.StatusAccepted, map[string]any{
