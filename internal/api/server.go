@@ -15,6 +15,12 @@
 //	GET /apps/{name}/logs stream container logs via the worker
 //	POST /apps/{name}/domains attach a hostname (DNS-checked)
 //	GET /apps/{name}/domains list an app's domains
+//	GET /apps/{name}/env list variables (secrets as names only)
+//	PUT /apps/{name}/env/{key} set or replace a variable
+//	DELETE /apps/{name}/env/{key} remove a variable
+//	POST /credentials create or rotate a registry login (sealed)
+//	GET /credentials list registry logins (no tokens)
+//	DELETE /credentials/{name} remove an unreferenced login
 //
 // There is no authentication yet; the mitigation
 // is the loopback-only bind plus filesystem permissions on the Unix socket
@@ -168,6 +174,10 @@ type server struct {
 	// resolve performs DNS lookups for the domain attach check; tests
 	// inject their own.
 	resolve Resolver
+	// pubKey is the sealing public key, loaded once on first secret
+	// write and kept for the process lifetime.
+	pubKey     []byte
+	pubKeyPath string
 }
 
 // newMux builds the route table. Exported behavior for tests via httptest.
@@ -188,6 +198,8 @@ func newMuxWith(s *store.Store, runDir string, logger *slog.Logger, resolve Reso
 		logger:  logger,
 		runDir:  runDir,
 		resolve: resolve,
+		pubKeyPath: envOr("TINYSHIP_SECRETS_PUB",
+			filepath.Join("/etc/tinyship/keys", "secrets.pub")),
 		workerClient: &http.Client{
 			Transport: &http.Transport{
 				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -212,6 +224,12 @@ func newMuxWith(s *store.Store, runDir string, logger *slog.Logger, resolve Reso
 	mux.HandleFunc("GET /apps/{name}/logs", srv.handleLogs)
 	mux.HandleFunc("POST /apps/{name}/domains", srv.handleAddDomain)
 	mux.HandleFunc("GET /apps/{name}/domains", srv.handleListDomains)
+	mux.HandleFunc("GET /apps/{name}/env", srv.handleListEnv)
+	mux.HandleFunc("PUT /apps/{name}/env/{key}", srv.handleSetEnv)
+	mux.HandleFunc("DELETE /apps/{name}/env/{key}", srv.handleUnsetEnv)
+	mux.HandleFunc("POST /credentials", srv.handleCreateCredential)
+	mux.HandleFunc("GET /credentials", srv.handleListCredentials)
+	mux.HandleFunc("DELETE /credentials/{name}", srv.handleDeleteCredential)
 	mux.HandleFunc("GET /deployments/{id}", srv.handleShowDeployment)
 	return mux
 }
