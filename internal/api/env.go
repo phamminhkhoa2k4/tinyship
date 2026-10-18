@@ -59,7 +59,7 @@ func (s *server) handleSetEnv(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	key := strings.ToUpper(strings.TrimSpace(r.PathValue("key")))
+	key := strings.TrimSpace(r.PathValue("key"))
 	var body envBody
 	if err := readJSONBody(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, "E_VALIDATION", err.Error())
