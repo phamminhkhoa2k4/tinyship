@@ -61,6 +61,30 @@ func TestAddDomainTakenByOtherApp(t *testing.T) {
 	}
 }
 
+func TestDeleteDomain(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t)
+	web := createApp(t, s, "web")
+	api := createApp(t, s, "api")
+
+	if _, _, err := s.AddDomain(ctx, web, "web.example.com"); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	// An app may only remove hostnames it owns itself.
+	if err := s.DeleteDomain(ctx, api, "web.example.com"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("delete by other app = %v, want ErrNotFound", err)
+	}
+	if err := s.DeleteDomain(ctx, web, "web.example.com"); err != nil {
+		t.Fatalf("delete own: %v", err)
+	}
+	if _, err := s.GetDomainByHost(ctx, "web.example.com"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("host after delete = %v, want ErrNotFound", err)
+	}
+	if err := s.DeleteDomain(ctx, web, "web.example.com"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("second delete = %v, want ErrNotFound", err)
+	}
+}
+
 func TestSetDomainStatus(t *testing.T) {
 	ctx := context.Background()
 	s := openTest(t)

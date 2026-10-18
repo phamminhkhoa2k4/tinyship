@@ -57,6 +57,60 @@ func (s *Store) CreateApp(ctx context.Context, in CreateAppInput) (*App, error) 
 	return s.GetAppByID(ctx, id)
 }
 
+// MarkAppDeleting flags an app as going away: admission and budget
+// math immediately stop counting it, while the teardown job runs.
+func (s *Store) MarkAppDeleting(ctx context.Context, appID string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE apps SET deleting = 1, updated_at = ? WHERE id = ?`,
+		time.Now().UTC().UnixMilli(), appID)
+	if err != nil {
+		return fmt.Errorf("store: mark app deleting: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// PurgeApp removes an app and every dependent row in one transaction.
+// The schema does not cascade most foreign keys, so the order matters:
+// children first, the app row last. Jobs are detached (app_id NULL)
+// rather than deleted: the queue is also history, and the running
+// teardown job must keep its row to finish against.
+func (s *Store) PurgeApp(ctx context.Context, appID string) error {
+	return s.WithTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM deployment_events WHERE deployment_id IN
+			      (SELECT id FROM deployments WHERE app_id = ?)`, appID); err != nil {
+			return fmt.Errorf("store: purge deployment events: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM deployments WHERE app_id = ?`, appID); err != nil {
+			return fmt.Errorf("store: purge deployments: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM domains WHERE app_id = ?`, appID); err != nil {
+			return fmt.Errorf("store: purge domains: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM container_state WHERE app_id = ?`, appID); err != nil {
+			return fmt.Errorf("store: purge container state: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE jobs SET app_id = NULL WHERE app_id = ?`, appID); err != nil {
+			return fmt.Errorf("store: detach jobs: %w", err)
+		}
+		res, err := tx.ExecContext(ctx, `DELETE FROM apps WHERE id = ?`, appID)
+		if err != nil {
+			return fmt.Errorf("store: purge app: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
 // GetAppByID fetches one app by id (ErrNotFound when absent).
 func (s *Store) GetAppByID(ctx context.Context, id string) (*App, error) {
 	return s.scanApp(s.db.QueryRowContext(ctx, `

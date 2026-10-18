@@ -119,6 +119,21 @@ func (s *Store) scanDomain(row scannable) (*Domain, error) {
 	return &d, nil
 }
 
+// DeleteDomain removes one hostname from an app (ErrNotFound when the
+// app does not own that hostname). The caller regenerates proxy routes
+// afterwards; this function only touches the row.
+func (s *Store) DeleteDomain(ctx context.Context, appID, hostname string) error {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM domains WHERE app_id = ? AND hostname = ?`, appID, hostname)
+	if err != nil {
+		return fmt.Errorf("store: delete domain: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // SetDomainStatus moves a domain between pending_dns/active/error.
 func (s *Store) SetDomainStatus(ctx context.Context, id, status string) error {
 	switch status {
