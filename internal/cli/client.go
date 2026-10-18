@@ -2,8 +2,9 @@ package cli
 
 // apiClient is the CLI's thin HTTP client for the local control API. The
 // base URL comes from TINYSHIP_API (default the loopback control
-// address); there is no auth yet, so the CLI relies on the API being
-// bound to 127.0.0.1 only.
+// address). Admin authentication uses a bearer token read from a system
+// file (TINYSHIP_TOKEN_FILE overrides it for tests and staging); the API
+// rejects requests without one, so the client sends it whenever present.
 
 import (
 	"bytes"
@@ -13,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -21,8 +23,17 @@ import (
 // trust positions).
 const DefaultAPIBase = "http://127.0.0.1:7878"
 
+// DefaultTokenFile is where the admin token lives on a host managed by
+// the installer. Mode 0640, owner root, group tinyship-admin: readable
+// by the CLI's normal operators, not by other local users.
+const DefaultTokenFile = "/etc/tinyship/token"
+
 type apiClient struct {
 	base string
+	// token is the bearer credential read from tokenPath; empty when the
+	// file is missing or unreadable (the API then rejects and guides).
+	token     string
+	tokenPath string
 	// regular bounds ordinary calls; streams (logs --follow, deploy
 	// --wait polls) use their own clients/contexts.
 	regular *http.Client
@@ -35,11 +46,28 @@ func newAPIClient() *apiClient {
 	if base == "" {
 		base = DefaultAPIBase
 	}
-	return &apiClient{
-		base:    base,
-		regular: &http.Client{Timeout: 30 * time.Second},
-		stream:  &http.Client{},
+	tokenPath := os.Getenv("TINYSHIP_TOKEN_FILE")
+	if tokenPath == "" {
+		tokenPath = DefaultTokenFile
 	}
+	return &apiClient{
+		base:      base,
+		token:     readTokenFile(tokenPath),
+		tokenPath: tokenPath,
+		regular:   &http.Client{Timeout: 30 * time.Second},
+		stream:    &http.Client{},
+	}
+}
+
+// readTokenFile returns the trimmed token from path, or "" when the file
+// cannot be read (the 401 the API returns then tells the operator how to
+// re-issue a token).
+func readTokenFile(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
 }
 
 // errEnvelope is the API's uniform error shape.
@@ -72,6 +100,9 @@ func (c *apiClient) newRequest(ctx context.Context, method, path string, body []
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 	return req, nil
 }

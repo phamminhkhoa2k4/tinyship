@@ -37,6 +37,8 @@ func RunWithIO(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		return dispatchEnv(ctx, args[1:], stdout, stderr)
 	case "credential", "credentials":
 		return dispatchCredential(ctx, args[1:], stdout, stderr)
+	case "token":
+		return dispatchToken(ctx, args[1:], stdout, stderr)
 	case "deploy":
 		return cmdDeploy(ctx, args[1:], stdout, stderr)
 	case "rollback":
@@ -99,6 +101,7 @@ Commands:
   domain        Attach, list, and remove hostnames per app
   env           Set, list, and unset app variables (secrets supported)
   credential    Store registry logins for private images
+  token         Issue, list, revoke, and rotate admin tokens
   deploy        Queue a deploy of an app's current config
   rollback      Roll an app back to its most recent good release
   logs          Read the current container's logs
