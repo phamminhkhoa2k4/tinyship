@@ -928,3 +928,61 @@ func appHasWritableVolumes(ctx context.Context, c *apiClient, name string) (bool
 	}
 	return false, nil
 }
+
+// cmdAppDelete queues an app teardown. Deletion is destructive and
+// asynchronous: --yes is required so a typo cannot remove a running
+// app, and the worker does the container and route cleanup after the
+// API marks the row.
+func cmdAppDelete(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	fs := flagSet("app delete", stderr, `usage: tinyship app delete <name> --yes
+
+Stop and remove the app's container and routes, then delete its rows
+(history, domains, env, and credentials stay in place; named volumes
+keep their data). The API marks the app immediately and queues the
+teardown; deletion runs asynchronously in the worker.
+`)
+	yes := fs.Bool("yes", false, "confirm the deletion (required)")
+	jsonOut := fs.Bool("json", false, "print the queue response verbatim as JSON")
+	pos, code := parseFlags(fs, args)
+	if code >= 0 {
+		return code
+	}
+	if len(pos) != 1 {
+		fmt.Fprintln(stderr, "tinyship app delete: exactly one app name is required")
+		return 2
+	}
+	if !*yes {
+		fmt.Fprintln(stderr, "tinyship app delete: --yes is required; this stops and removes the app.\n"+
+			"Re-run as: tinyship app delete <name> --yes")
+		return 2
+	}
+	name := pos[0]
+
+	c := newAPIClient()
+	resp, err := c.do(ctx, http.MethodDelete, "/apps/"+name, nil)
+	if err != nil {
+		fmt.Fprintf(stderr, "tinyship app delete: %v\n", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		fmt.Fprintf(stderr, "tinyship app delete: %v\n", apiError(resp))
+		return 1
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	if *jsonOut {
+		fmt.Fprint(stdout, string(raw))
+		return 0
+	}
+	var queued struct {
+		JobID   string `json:"job_id"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(raw, &queued); err != nil {
+		fmt.Fprintf(stderr, "tinyship app delete: decode: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "Deletion of %s queued (job %s).\n", name, queued.JobID)
+	fmt.Fprintf(stdout, "Named volumes keep their data; remove them yourself if you want the disk back.\n")
+	return 0
+}

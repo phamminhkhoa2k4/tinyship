@@ -17,13 +17,15 @@ import (
 // dispatchDomain handles the `tinyship domain <subcommand>` group.
 func dispatchDomain(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "tinyship domain: subcommand required: add or list")
+		fmt.Fprintln(stderr, "tinyship domain: subcommand required: add, list, or remove")
 		usageDomain(stderr)
 		return 2
 	}
 	switch args[0] {
 	case "add":
 		return cmdDomainAdd(ctx, args[1:], stdout, stderr)
+	case "remove", "rm":
+		return cmdDomainRemove(ctx, args[1:], stdout, stderr)
 	case "list", "ls":
 		return cmdDomainList(ctx, args[1:], stdout, stderr)
 	case "help", "--help", "-h":
@@ -40,10 +42,12 @@ func usageDomain(w io.Writer) {
 	fmt.Fprint(w, `usage:
   tinyship domain add <app> <hostname> [--skip-dns-check] [--json]
   tinyship domain list <app> [--json]
+  tinyship domain remove <app> <hostname> [--json]
 
 Domains only route after a succeeded deploy. A domain whose DNS does
 not point at this host stays pending_dns and receives no traffic.
-Run 'tinyship domain add --help' for all flags.
+Removing a hostname detaches it and drops its route on the next
+worker sync. Run 'tinyship domain add --help' for all flags.
 `)
 }
 
@@ -164,5 +168,51 @@ func cmdDomainList(ctx context.Context, args []string, stdout, stderr io.Writer)
 		fmt.Fprintf(stderr, "tinyship domain list: %v\n", err)
 		return 1
 	}
+	return 0
+}
+
+// cmdDomainRemove detaches one hostname from an app. The row goes
+// immediately; the queued sync drops the route from the proxy without
+// waiting for the app's next deploy.
+func cmdDomainRemove(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	fs := flagSet("domain remove", stderr,
+		"usage: tinyship domain remove <app> <hostname> [--json]\n")
+	jsonOut := fs.Bool("json", false, "print the API response verbatim as JSON")
+	pos, code := parseFlags(fs, args)
+	if code >= 0 {
+		return code
+	}
+	if len(pos) != 2 {
+		fmt.Fprintln(stderr, "tinyship domain remove: an app name and a hostname are required")
+		return 2
+	}
+	app, hostname := pos[0], pos[1]
+
+	c := newAPIClient()
+	path := "/apps/" + app + "/domains/" + hostname
+	resp, err := c.do(ctx, http.MethodDelete, path, nil)
+	if err != nil {
+		fmt.Fprintf(stderr, "tinyship domain remove: %v\n", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		fmt.Fprintf(stderr, "tinyship domain remove: %v\n", apiError(resp))
+		return 1
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	if *jsonOut {
+		fmt.Fprint(stdout, string(raw))
+		return 0
+	}
+	var queued struct {
+		JobID string `json:"job_id"`
+	}
+	if err := json.Unmarshal(raw, &queued); err != nil {
+		fmt.Fprintf(stderr, "tinyship domain remove: decode: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "Hostname %s detached from %s (route sync job %s).\n",
+		hostname, app, queued.JobID)
 	return 0
 }
