@@ -39,6 +39,8 @@ func RunWithIO(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		return dispatchCredential(ctx, args[1:], stdout, stderr)
 	case "token":
 		return dispatchToken(ctx, args[1:], stdout, stderr)
+	case "uninstall":
+		return cmdUninstall(ctx, args[1:], stdout, stderr)
 	case "deploy":
 		return cmdDeploy(ctx, args[1:], stdout, stderr)
 	case "rollback":
@@ -109,6 +111,7 @@ Commands:
   status        Show API health and apps
   budget        Show or set the host RAM budget
   keygen        Generate the secret encryption key pair
+  uninstall     Remove the control plane (root; --purge for everything)
   version       Print binary, commit, and DB schema versions
   help          Show this help
 
