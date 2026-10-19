@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"embed"
 	"encoding/hex"
 	"errors"
@@ -144,6 +145,38 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 		}
 	}
 	return nil
+}
+
+// Snapshot writes a transactionally consistent copy of the database to
+// dst (which must not exist yet) using VACUUM INTO: SQLite builds the
+// copy from a read transaction, so writers at the snapshot moment yield
+// a complete file, never a torn copy of a WAL database in flight. This
+// is the backup path.
+func (s *Store) Snapshot(ctx context.Context, dst string) error {
+	if _, err := s.db.ExecContext(ctx, "VACUUM INTO ?", dst); err != nil {
+		return fmt.Errorf("store: snapshot to %s: %w", dst, err)
+	}
+	return nil
+}
+
+// AppliedSchemaVersion returns the highest migration version recorded in
+// this database, 0 when no migration has been applied yet. Unlike
+// SchemaVersion() this reads the data, not the binary: it answers what
+// state the database is in, which a backup manifest needs.
+func (s *Store) AppliedSchemaVersion(ctx context.Context) (int, error) {
+	var v sql.NullInt64
+	err := s.db.QueryRowContext(ctx,
+		"SELECT MAX(version) FROM schema_migrations").Scan(&v)
+	if err != nil {
+		if strings.Contains(err.Error(), "no such table") {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("store: read applied schema version: %w", err)
+	}
+	if !v.Valid {
+		return 0, nil
+	}
+	return int(v.Int64), nil
 }
 
 func (s *Store) applyOne(ctx context.Context, m Migration) error {

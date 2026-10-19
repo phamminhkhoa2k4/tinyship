@@ -41,6 +41,8 @@ func RunWithIO(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		return dispatchToken(ctx, args[1:], stdout, stderr)
 	case "uninstall":
 		return cmdUninstall(ctx, args[1:], stdout, stderr)
+	case "backup":
+		return cmdBackup(ctx, args[1:], stdout, stderr)
 	case "deploy":
 		return cmdDeploy(ctx, args[1:], stdout, stderr)
 	case "rollback":
@@ -112,6 +114,7 @@ Commands:
   budget        Show or set the host RAM budget
   keygen        Generate the secret encryption key pair
   uninstall     Remove the control plane (root; --purge for everything)
+  backup        Write one backup file: DB snapshot, config, keys, token (root)
   version       Print binary, commit, and DB schema versions
   help          Show this help
 
