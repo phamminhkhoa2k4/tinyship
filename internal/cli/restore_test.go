@@ -89,6 +89,16 @@ func TestRestoreFreshRootRoundtrip(t *testing.T) {
 	if _, err := os.Stat(db); err != nil {
 		t.Fatalf("restored db missing: %v", err)
 	}
+	// The data directory must keep its setgid bit: files the services
+	// create inside it later need the tinyship-db group without
+	// anyone remembering to set it.
+	dataDir, err := os.Stat(filepath.Join(dst, "var/lib/tinyship"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dataDir.Mode()&os.ModeSetgid == 0 {
+		t.Errorf("data directory mode = %v, want the setgid bit kept", dataDir.Mode())
+	}
 	ds, err := store.Open(context.Background(), db)
 	if err != nil {
 		t.Fatalf("open restored db: %v", err)

@@ -84,13 +84,36 @@ func restoreTargets(root string) []restoreTarget {
 		{member: "etc/tinyship/token", path: tokenPath, mode: 0o640, owner: "root", group: "tinyship-admin"},
 		{member: "_", path: filepath.Join(base, "etc/tinyship"), mode: 0o750, owner: "root", group: "tinyship"},
 		{member: "_", path: keysDir, mode: 0o750, owner: "root", group: "tinyship"},
-		{member: "_", path: filepath.Join(base, "var/lib/tinyship"), mode: 0o770, owner: "tinyship", group: "tinyship-db"},
+		// The data directory is setgid (2770): files created inside it
+		// later must land in the tinyship-db group without anyone
+		// having to remember the group.
+		{member: "_", path: filepath.Join(base, "var/lib/tinyship"), mode: 0o2770, owner: "tinyship", group: "tinyship-db"},
 		{member: "_", path: filepath.Join(base, "var/lib/tinyship/backups"), mode: 0o700, owner: "root", group: "root"},
 	}
 }
 
 // chownPath best-effort sets owner:group; a missing user (fresh machine
 // before install) is reported by the caller, not fatal here.
+// unixMode translates a Unix octal mode, which may carry the
+// setuid/setgid/sticky bits at 0o4000/0o2000/0o1000, into a Go
+// FileMode. Go keeps those bits in named flags instead of the octal
+// value, so passing 0o2770 straight to Chmod would silently drop the
+// setgid bit and the data directory would lose the group inheritance
+// the services rely on.
+func unixMode(mode os.FileMode) os.FileMode {
+	perm := mode & os.ModePerm
+	if mode&0o4000 != 0 {
+		perm |= os.ModeSetuid
+	}
+	if mode&0o2000 != 0 {
+		perm |= os.ModeSetgid
+	}
+	if mode&0o1000 != 0 {
+		perm |= os.ModeSticky
+	}
+	return perm
+}
+
 func chownPath(path, owner, group string) error {
 	uid, err := lookupUID(owner)
 	if err != nil {
@@ -283,11 +306,11 @@ at the end lists exactly which apps need it.
 		if t.member != "_" {
 			continue
 		}
-		if err := os.MkdirAll(t.path, t.mode); err != nil {
+		if err := os.MkdirAll(t.path, unixMode(t.mode)); err != nil {
 			fmt.Fprintf(stderr, "tinyship restore: create %s: %v\n", t.path, err)
 			return 1
 		}
-		if err := os.Chmod(t.path, t.mode); err != nil {
+		if err := os.Chmod(t.path, unixMode(t.mode)); err != nil {
 			fmt.Fprintf(stderr, "tinyship restore: chmod %s: %v\n", t.path, err)
 			return 1
 		}
@@ -305,12 +328,12 @@ at the end lists exactly which apps need it.
 			fmt.Fprintf(stderr, "tinyship restore: create %s: %v\n", filepath.Dir(t.path), err)
 			return 1
 		}
-		if err := os.WriteFile(t.path, arc.Files[mem.Name], t.mode); err != nil {
+		if err := os.WriteFile(t.path, arc.Files[mem.Name], unixMode(t.mode)); err != nil {
 			fmt.Fprintf(stderr, "tinyship restore: write %s: %v\n", t.path, err)
 			return 1
 		}
 		// umask can loosen the create mode; re-assert it.
-		if err := os.Chmod(t.path, t.mode); err != nil {
+		if err := os.Chmod(t.path, unixMode(t.mode)); err != nil {
 			fmt.Fprintf(stderr, "tinyship restore: chmod %s: %v\n", t.path, err)
 			return 1
 		}
