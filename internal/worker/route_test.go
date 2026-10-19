@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -220,16 +221,22 @@ func TestBuildOptionsFromEnv(t *testing.T) {
 }
 
 func TestDefaultProbeSwitchesToTLSWithAURL(t *testing.T) {
-	var seenHost string
-	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var seenHost, seenSNI string
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenHost = r.Host
 		w.WriteHeader(http.StatusTeapot)
 	}))
+	ts.TLS = &tls.Config{GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+		seenSNI = chi.ServerName
+		return nil, nil
+	}}
+	ts.StartTLS()
 	defer ts.Close()
 
 	// httptest's URL is https://127.0.0.1:<port>; the probe trusts the
 	// routing, not the issuer, so the self-signed certificate must not
-	// matter.
+	// matter. SNI must still carry the hostname: the proxy refuses a
+	// handshake whose server name matches no route.
 	t.Setenv("TINYSHIP_CADDY_PROBE", ts.URL)
 	got, err := DefaultProbe(context.Background(), "app.example.test")
 	if err != nil {
@@ -240,6 +247,9 @@ func TestDefaultProbeSwitchesToTLSWithAURL(t *testing.T) {
 	}
 	if seenHost != "app.example.test" {
 		t.Errorf("Host header = %q, want the routed hostname", seenHost)
+	}
+	if seenSNI != "app.example.test" {
+		t.Errorf("SNI = %q, want the routed hostname", seenSNI)
 	}
 
 	// An explicit http:// prefix keeps the plain scheme.
