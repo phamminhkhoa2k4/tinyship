@@ -38,6 +38,13 @@ func TestValidateHostnameRejects(t *testing.T) {
 		{"bad-.example.com", "hyphen"},
 		{"under_score.example.com", "RFC 1123"},
 		{"exa mple.example.com", "RFC 1123"},
+		// Config-injection shapes: anything that could break out of a
+		// generated proxy config must be refused by the same character
+		// rule, long before any config is formatted.
+		{"example.com\nevil.example.com", "RFC 1123"},
+		{"example.com}evil", "RFC 1123"},
+		{"example.com\"quote", "RFC 1123"},
+		{"example.com{foo}", "RFC 1123"},
 		{"example.com.", "empty label"},
 		{strings.Repeat("a", 64) + ".example.com", "63"},
 		{strings.Repeat("a.", 130) + "com", "253"},
