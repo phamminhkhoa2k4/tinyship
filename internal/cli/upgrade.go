@@ -269,6 +269,11 @@ func reportUpgrade(res *upgrade.Result, runErr error, appliedSchema int, binaryP
 			fmt.Fprintf(stdout, "Verdict: BLOCKED — %s\n", res.Blocked)
 		case res.RolledBack:
 			fmt.Fprintln(stdout, "Verdict: FAILED and rolled back to the previous version.")
+		case runErr != nil:
+			// A run that failed before anything was swapped (bad
+			// checksum, refused source, backup failure): label the
+			// report as failed instead of leaving the neutral verdict.
+			fmt.Fprintf(stdout, "Verdict: FAILED — %s\n", errText(runErr))
 		case res.Swapped:
 			fmt.Fprintf(stdout, "Verdict: %s is now installed at %s.\n", res.Target.Version, binaryPath)
 		case res.AlreadyInstalled:

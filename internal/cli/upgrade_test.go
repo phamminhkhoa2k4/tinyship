@@ -132,12 +132,18 @@ func TestUpgradeChecksumMismatchRefused(t *testing.T) {
 	t.Setenv("TINYSHIP_DB", filepath.Join(root, "var/lib/tinyship/tinyship.db"))
 	wrong := strings.Repeat("ab", 32)
 
-	code, _, stderr := run(t, "upgrade", "--from", cand, "--sha256", wrong, "--install-root", root)
+	code, stdout, stderr := run(t, "upgrade", "--from", cand, "--sha256", wrong, "--install-root", root)
 	if code != 1 {
 		t.Fatalf("exit = %d, want 1", code)
 	}
 	if !strings.Contains(stderr, "checksum") {
 		t.Errorf("stderr = %q, want a checksum complaint", stderr)
+	}
+	if !strings.Contains(stdout, "Verdict: FAILED") {
+		t.Errorf("a failed run must not read as compatible:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "nothing was changed") {
+		t.Errorf("neutral verdict on a failed run:\n%s", stdout)
 	}
 	data, _ := os.ReadFile(filepath.Join(root, "usr/local/bin/tinyship"))
 	if !strings.Contains(string(data), "0.1.0") {
