@@ -611,6 +611,14 @@ bootstrap_token() {
 
     if [[ -e "$tf" ]]; then
         log "existing $tf kept (idempotent install)"
+        if ! sandbox; then
+            # Re-assert the handoff the first run performed: the token
+            # file existing means the DB was created by root, and a DB
+            # left group-readable only would block the worker's writes
+            # (SQLite reports them as a read-only database).
+            chown tinyship:tinyship-db "$db" "$db-wal" "$db-shm" 2>/dev/null || true
+            chmod 0660 "$db" "$db-wal" "$db-shm" 2>/dev/null || true
+        fi
         return 0
     fi
 
@@ -623,10 +631,12 @@ bootstrap_token() {
     fi
     rm -f "$INSTALL_ROOT/token.err"
     if ! sandbox; then
-        # The token command runs as root, so re-own the files it created:
-        # the DB must be writable by the services, the token readable by
+        # The token command runs as root, so re-own and reopen the files
+        # it created: the DB must be writable by the services' group
+        # (0644 would let the group only read it), the token readable by
         # the admin group.
         chown tinyship:tinyship-db "$db" "$db-wal" "$db-shm" 2>/dev/null || true
+        chmod 0660 "$db" "$db-wal" "$db-shm" 2>/dev/null || true
         chown root:tinyship-admin "$tf" 2>/dev/null || true
     fi
     log "admin token created; keep the plaintext private (it is not recoverable from the database)"
