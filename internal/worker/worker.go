@@ -198,6 +198,11 @@ func RunStore(ctx context.Context, s *store.Store, cfg Config) error {
 		}
 	}
 
+	// Report-only drift check before claiming jobs: containers that
+	// should be running but are not, and containers running with no
+	// database row behind them. Nothing is remediated here.
+	bootReconcile(ctx, s, cfg.Docker, logger)
+
 	// The read-only log socket: the API reaches container logs only
 	// through here, and only after the ownership checks.
 	if cfg.RunDir != "" {
