@@ -58,6 +58,8 @@ func RunWithIO(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		return cmdDeployments(ctx, args[1:], stdout, stderr)
 	case "status":
 		return cmdStatus(ctx, args[1:], stdout, stderr)
+	case "doctor":
+		return cmdDoctor(ctx, args[1:], stdout, stderr)
 	case "budget":
 		return cmdBudget(ctx, args[1:], stdout, stderr)
 	case "keygen":
@@ -116,6 +118,7 @@ Commands:
   logs          Read the current container's logs
   deployments   Show an app's deployment history
   status        Show API health and apps
+  doctor        Diagnose the host: services, docker, files, DNS, drift
   budget        Show or set the host RAM budget
   keygen        Generate the secret encryption key pair
   uninstall     Remove the control plane (root; --purge for everything)
