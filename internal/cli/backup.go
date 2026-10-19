@@ -13,8 +13,10 @@ package cli
 // argv: --encrypt reads stdin, --passphrase-file reads a file.
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -66,11 +68,17 @@ func backupPassphrase(encrypt bool, passphraseFile string, in io.Reader) (string
 		return checkPassphrase(trimPassphrase(string(raw)))
 	}
 	if encrypt {
-		raw, err := io.ReadAll(io.LimitReader(in, 4096))
-		if err != nil {
+		// One line, not ReadAll: on an interactive terminal the next
+		// prompt (restore's confirmation) must still find stdin open,
+		// and passphrases never contain newlines anyway.
+		line, err := bufio.NewReader(in).ReadString('\n')
+		if err != nil && line == "" {
+			if errors.Is(err, io.EOF) {
+				return "", fmt.Errorf("the passphrase is empty (stdin closed); type a real passphrase")
+			}
 			return "", fmt.Errorf("read passphrase from stdin: %w", err)
 		}
-		return checkPassphrase(trimPassphrase(string(raw)))
+		return checkPassphrase(trimPassphrase(line))
 	}
 	return "", nil
 }

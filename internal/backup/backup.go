@@ -252,6 +252,28 @@ func Write(w io.Writer, opts Options) (*Manifest, error) {
 	return manifest, nil
 }
 
+// ArchiveEncrypted reports whether the already-open archive at r needs
+// a passphrase, reading only the fixed header. It is the cheap probe a
+// restore uses to decide whether to ask for a passphrase before doing
+// any real work; r must be seekable.
+func ArchiveEncrypted(r io.ReadSeeker) (bool, error) {
+	head := make([]byte, headerLen)
+	if _, err := io.ReadFull(r, head); err != nil {
+		return false, fmt.Errorf("backup: read header: %w", err)
+	}
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return false, fmt.Errorf("backup: rewind: %w", err)
+	}
+	if string(head[:len(Magic)]) != Magic {
+		return false, ErrWrongMagic
+	}
+	if head[len(Magic)] != FormatVersion {
+		return false, fmt.Errorf("backup: format version %d is not supported by this binary (expects %d)",
+			head[len(Magic)], FormatVersion)
+	}
+	return head[len(Magic)+1]&flagEncrypted != 0, nil
+}
+
 // Read parses and fully verifies a backup. Every member's checksum is
 // checked against the manifest and every manifest member must be
 // present; nothing is returned to the caller before both hold.

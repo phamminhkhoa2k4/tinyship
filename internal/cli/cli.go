@@ -43,6 +43,8 @@ func RunWithIO(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		return cmdUninstall(ctx, args[1:], stdout, stderr)
 	case "backup":
 		return cmdBackup(ctx, args[1:], stdout, stderr)
+	case "restore":
+		return cmdRestore(ctx, args[1:], stdout, stderr)
 	case "deploy":
 		return cmdDeploy(ctx, args[1:], stdout, stderr)
 	case "rollback":
@@ -115,6 +117,7 @@ Commands:
   keygen        Generate the secret encryption key pair
   uninstall     Remove the control plane (root; --purge for everything)
   backup        Write one backup file: DB snapshot, config, keys, token (root)
+  restore       Restore a backup file and report which apps need a deploy (root)
   version       Print binary, commit, and DB schema versions
   help          Show this help
 
