@@ -25,6 +25,7 @@ DOCKER_MIN_API=1.43   # Docker Engine 24.0
 CHECK_ONLY=0
 ASSUME_YES=0
 FROM_LOCAL=""
+API_LISTEN=""        # optional explicit API TCP address (loopback unless --api-listen says otherwise)
 # TINYSHIP_INSTALL_ROOT prefixes every path the installer writes. It
 # exists for development and test hosts: a sandbox install writes files
 # only, touching no users, groups, or services, and needs no root.
@@ -50,6 +51,10 @@ Options:
   --yes               Non-interactive mode (assume yes for prompts, including
                       the Docker install)
   --from-local PATH   Install the given locally built tinyship binary
+  --api-listen ADDR   Serve the API on ADDR (host:port). A loopback address
+                      behaves like the default; any other address also passes
+                      --allow-remote to the service and prints a warning: the
+                      API and dashboard become reachable from the network
   -h, --help          Show this help
 
 Environment:
@@ -370,6 +375,11 @@ install_from_local() {
 
     start_services
 
+    if [[ -n "$API_LISTEN" ]] && ! api_listen_is_loopback "$API_LISTEN"; then
+        warn "the API now listens on $API_LISTEN: the API and dashboard are reachable from the network"
+        warn "anyone with the admin token can control this host; firewall the port or keep the loopback default unless you need remote access"
+    fi
+
     log "install done; the admin token above was shown once — store it safely"
     log "create your first app: tinyship app create --name web --image traefik/whoami --port 8080"
 }
@@ -431,6 +441,9 @@ paths:
   token: /etc/tinyship/token
 EOF
     chmod 0640 "$path"
+    if [[ -n "$API_LISTEN" ]]; then
+        sed -i "s|tcp_listen: 127.0.0.1:7878|tcp_listen: $API_LISTEN|" "$path"
+    fi
     if ! sandbox; then
         chown root:tinyship "$path" 2>/dev/null || true
     fi
@@ -476,6 +489,13 @@ write_units() {
         log "existing systemd units kept (idempotent install)"
     else
         install -d -m 0755 "$(dirname "$api_unit")"
+        local api_exec="/usr/local/bin/tinyship api"
+        if [[ -n "$API_LISTEN" ]]; then
+            api_exec+=" --listen $API_LISTEN"
+            if ! api_listen_is_loopback "$API_LISTEN"; then
+                api_exec+=" --allow-remote"
+            fi
+        fi
         cat >"$api_unit" <<'EOF'
 [Unit]
 Description=TinyShip API server
@@ -515,6 +535,7 @@ MemoryMax=200M
 [Install]
 WantedBy=multi-user.target
 EOF
+        sed -i "s|^ExecStart=.*|ExecStart=$api_exec|" "$api_unit"
         cat >"$worker_unit" <<'EOF'
 [Unit]
 Description=TinyShip job worker
@@ -644,11 +665,22 @@ bootstrap_token() {
 
 # --------------------------------------------------------------------- main
 
+# api_listen_is_loopback reports whether the --api-listen address
+# targets only the loopback interface.
+api_listen_is_loopback() {
+    case "$1" in
+        127.*:*|localhost:*|\[::1\]:*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --check-only) CHECK_ONLY=1 ;;
         --yes)        ASSUME_YES=1 ;;
         --from-local) shift; FROM_LOCAL="${1:-}"; [[ -n "$FROM_LOCAL" ]] || { fail "--from-local needs a path"; exit 2; } ;;
+        --api-listen) shift; API_LISTEN="${1:-}"
+                    [[ "$API_LISTEN" == *:* ]] || { fail "--api-listen needs a host:port address"; exit 2; } ;;
         -h|--help)    usage; exit 0 ;;
         *)            fail "unknown option: $1"; usage >&2; exit 2 ;;
     esac

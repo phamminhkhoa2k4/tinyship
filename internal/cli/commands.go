@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -684,9 +685,10 @@ func cmdStatus(ctx context.Context, args []string, stdout, stderr io.Writer) int
 
 	c := newAPIClient()
 	var health struct {
-		Status  string `json:"status"`
-		Version string `json:"version"`
-		Commit  string `json:"commit"`
+		Status    string `json:"status"`
+		Version   string `json:"version"`
+		Commit    string `json:"commit"`
+		TCPListen string `json:"tcp_listen"`
 	}
 	if err := c.doJSON(ctx, http.MethodGet, "/healthz", nil, &health); err != nil {
 		fmt.Fprintf(stderr, "tinyship status: API unreachable at %s (is `tinyship api` running?): %v\n",
@@ -706,13 +708,20 @@ func cmdStatus(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		fmt.Fprintf(stderr, "tinyship status: %v\n", err)
 		return 1
 	}
+	warning := remoteListenWarning(health.TCPListen)
 	if *jsonOut {
 		out := map[string]any{"api": health, "apps": apps.Apps}
+		if warning != "" {
+			out["warnings"] = []string{warning}
+		}
 		raw, _ := json.Marshal(out)
 		fmt.Fprintln(stdout, string(raw))
 		return 0
 	}
 	fmt.Fprintf(stdout, "API     %s (version %s, commit %s)\n", strings.ToUpper(health.Status), health.Version, health.Commit)
+	if warning != "" {
+		fmt.Fprintf(stdout, "WARNING %s\n", warning)
+	}
 	fmt.Fprintf(stdout, "Apps    %d\n", len(apps.Apps))
 	for _, a := range apps.Apps {
 		ref := a.Image
@@ -733,6 +742,25 @@ func shortID(id string) string {
 		return id[:10]
 	}
 	return id
+}
+
+// remoteListenWarning returns the operator warning for a non-loopback
+// API listen address, or "" when the address is loopback or unknown.
+func remoteListenWarning(tcpListen string) string {
+	if tcpListen == "" {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(tcpListen)
+	if err != nil {
+		return ""
+	}
+	if host == "localhost" {
+		return ""
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return ""
+	}
+	return fmt.Sprintf("the API is listening on %s and is reachable from the network; anyone with the admin token can control this host", tcpListen)
 }
 
 // budgetGrantView is one app's memory grant in the budget response.

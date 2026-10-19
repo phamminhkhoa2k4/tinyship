@@ -262,7 +262,7 @@ func newDomainServer(t *testing.T, resolve func(string) ([]net.IP, error)) *doma
 	mux := newMuxWith(s, t.TempDir(), slog.New(slog.DiscardHandler),
 		func(_ context.Context, hostname string) ([]net.IP, error) {
 			return ds.resolve(hostname)
-		}, nil)
+		}, nil, DefaultTCPAddr)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	ds.srv = srv

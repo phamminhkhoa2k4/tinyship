@@ -35,7 +35,8 @@ func authServer(t *testing.T) (*httptest.Server, *store.Store, string) {
 		t.Fatalf("create token: %v", err)
 	}
 	mux := newMuxWith(s, t.TempDir(), slog.New(slog.DiscardHandler),
-		func(context.Context, string) ([]net.IP, error) { return nil, nil }, s)
+		func(context.Context, string) ([]net.IP, error) { return nil, nil }, s,
+		DefaultTCPAddr)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv, s, raw

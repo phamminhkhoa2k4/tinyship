@@ -34,6 +34,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -50,8 +51,9 @@ import (
 	"github.com/tinyship/tinyship/internal/worker"
 )
 
-// DefaultTCPAddr is the loopback-only listen address. Never bind
-// a wildcard address: the dashboard/API must not be Internet-reachable
+// DefaultTCPAddr is the loopback-only listen address. The API and
+// dashboard must not be Internet-reachable by default; serving on a
+// non-loopback address requires the explicit --allow-remote opt-in
 const DefaultTCPAddr = "127.0.0.1:7878"
 
 // DefaultRunDir mirrors the worker's run dir; TINYSHIP_RUN_DIR
@@ -65,12 +67,39 @@ const APISockName = "api.sock"
 // capped at appconfig.MaxConfigBytes.
 const maxConfigBody = appconfig.MaxConfigBytes + 4096
 
+// isLoopbackAddr reports whether addr targets only the loopback
+// interface. A wildcard host (":7878", "0.0.0.0", "[::]") is not
+// loopback: it would expose the API to the network.
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 // Run starts the API server and blocks until ctx is cancelled or the server
-// fails. argv is accepted so subcommand flags can be added without touching
-// cmd/tinyship.
+// fails. argv carries the subcommand flags (--listen, --allow-remote).
 func Run(ctx context.Context, argv []string) int {
-	if len(argv) > 0 {
-		fmt.Fprintf(os.Stderr, "tinyship api: unexpected arguments %v\n", argv)
+	fs := flag.NewFlagSet("tinyship api", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	listen := fs.String("listen", DefaultTCPAddr,
+		"TCP address to serve on (loopback only unless --allow-remote is given)")
+	allowRemote := fs.Bool("allow-remote", false,
+		"permit serving on a non-loopback address")
+	if err := fs.Parse(argv); err != nil {
+		return 2
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "tinyship api: unexpected arguments %v\n", fs.Args())
+		return 2
+	}
+	if !isLoopbackAddr(*listen) && !*allowRemote {
+		fmt.Fprintf(os.Stderr, "tinyship api: refusing to listen on %s: it is not a loopback address; pass --allow-remote if you intend to expose the API and dashboard to the network\n", *listen)
 		return 2
 	}
 
@@ -87,20 +116,20 @@ func Run(ctx context.Context, argv []string) int {
 
 	handler := newMuxWith(s, runDir, logger, func(ctx context.Context, hostname string) ([]net.IP, error) {
 		return net.DefaultResolver.LookupIP(ctx, "ip", hostname)
-	}, s)
+	}, s, *listen)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	lnTCP, err := net.Listen("tcp", DefaultTCPAddr)
+	lnTCP, err := net.Listen("tcp", *listen)
 	if err != nil {
-		logger.Error("api: cannot listen", "addr", DefaultTCPAddr, "err", err)
+		logger.Error("api: cannot listen", "addr", *listen, "err", err)
 		return 1
 	}
 	var lnUnix net.Listener
 	if sock, err := listenUnix(runDir); err != nil {
 		// A missing run dir only breaks the socket transport; the TCP
-		// loopback listener still serves the CLI and dashboards.
+		// listener still serves the CLI and dashboards.
 		logger.Warn("api: unix socket unavailable, continuing on TCP only",
 			"err", err)
 	} else {
@@ -113,7 +142,11 @@ func Run(ctx context.Context, argv []string) int {
 	if lnUnix != nil {
 		go func() { errs <- srv.Serve(lnUnix) }()
 	}
-	logger.Info("api: listening", "tcp", DefaultTCPAddr, "unix", unixPath(lnUnix))
+	logger.Info("api: listening", "tcp", *listen, "unix", unixPath(lnUnix))
+	if !isLoopbackAddr(*listen) {
+		logger.Warn("api: serving on a non-loopback address; the API and dashboard are reachable from the network, keep the admin token safe",
+			"addr", *listen)
+	}
 
 	select {
 	case <-ctx.Done():
@@ -175,6 +208,9 @@ type server struct {
 	logger *slog.Logger
 	// runDir locates the worker's read-only log socket.
 	runDir string
+	// tcpAddr is the TCP listen address, reported by /healthz so the
+	// CLI can warn when it is not loopback.
+	tcpAddr string
 	// workerClient speaks HTTP over that socket; tests inject their own.
 	workerClient *http.Client
 	// resolve performs DNS lookups for the domain attach check; tests
@@ -197,13 +233,14 @@ type server struct {
 func newMux(s *store.Store, runDir string, logger *slog.Logger) http.Handler {
 	return newMuxWith(s, runDir, logger, func(ctx context.Context, hostname string) ([]net.IP, error) {
 		return net.DefaultResolver.LookupIP(ctx, "ip", hostname)
-	}, nil)
+	}, nil, DefaultTCPAddr)
 }
 
 // newMuxWith is newMux with an explicit DNS resolver (so domain-attach
-// tests script resolution outcomes) and an explicit authenticator (nil
-// disables auth, as in handler unit tests). Production passes the store.
-func newMuxWith(s *store.Store, runDir string, logger *slog.Logger, resolve Resolver, auth tokenVerifier) http.Handler {
+// tests script resolution outcomes), an explicit authenticator (nil
+// disables auth, as in handler unit tests), and the TCP address the
+// server reports as its listen target. Production passes the store.
+func newMuxWith(s *store.Store, runDir string, logger *slog.Logger, resolve Resolver, auth tokenVerifier, tcpAddr string) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -211,6 +248,7 @@ func newMuxWith(s *store.Store, runDir string, logger *slog.Logger, resolve Reso
 		store:   s,
 		logger:  logger,
 		runDir:  runDir,
+		tcpAddr: tcpAddr,
 		resolve: resolve,
 		auth:    auth,
 		limiter: newAuthLimiter(),
@@ -257,10 +295,11 @@ func newMuxWith(s *store.Store, runDir string, logger *slog.Logger, resolve Reso
 
 func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":  "ok",
-		"version": version.Version,
-		"commit":  version.Commit,
-		"time":    time.Now().UTC().Format(time.RFC3339),
+		"status":     "ok",
+		"version":    version.Version,
+		"commit":     version.Commit,
+		"time":       time.Now().UTC().Format(time.RFC3339),
+		"tcp_listen": s.tcpAddr,
 	})
 }
 

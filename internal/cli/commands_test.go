@@ -849,3 +849,85 @@ func TestRollbackRequiresOneAppName(t *testing.T) {
 		t.Errorf("stderr = %q", stderr)
 	}
 }
+
+// --- status: remote listen warning -------------------------------------------
+
+// statusAPI serves the two endpoints status queries, with a scripted
+// tcp_listen value.
+func statusAPI(t *testing.T, tcpListen string) {
+	t.Helper()
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/healthz":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"status": "ok", "version": "v0.1.0", "commit": "abc",
+				"tcp_listen": tcpListen,
+			})
+		case r.URL.Path == "/apps":
+			writeJSON(w, http.StatusOK, map[string]any{"apps": []any{}})
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			writeErr(w, http.StatusNotFound, "E_NOT_FOUND", "x")
+		}
+	}))
+}
+
+func TestStatusWarnsOnNonLoopbackListen(t *testing.T) {
+	statusAPI(t, "0.0.0.0:7878")
+	code, stdout, _ := run(t, "status")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stdout = %q", code, stdout)
+	}
+	if !strings.Contains(stdout, "WARNING") || !strings.Contains(stdout, "0.0.0.0:7878") {
+		t.Errorf("status must warn about the non-loopback listen address:\n%s", stdout)
+	}
+}
+
+func TestStatusWarnsInJSONOnNonLoopbackListen(t *testing.T) {
+	statusAPI(t, "0.0.0.0:7878")
+	code, stdout, _ := run(t, "status", "--json")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stdout = %q", code, stdout)
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+		t.Fatalf("invalid JSON %q: %v", stdout, err)
+	}
+	warnings, _ := got["warnings"].([]any)
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %v, want exactly one", got["warnings"])
+	}
+	if !strings.Contains(warnings[0].(string), "reachable from the network") {
+		t.Errorf("warning = %q", warnings[0])
+	}
+}
+
+func TestStatusStaysQuietOnLoopbackListen(t *testing.T) {
+	statusAPI(t, "127.0.0.1:7878")
+	code, stdout, _ := run(t, "status")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stdout = %q", code, stdout)
+	}
+	if strings.Contains(stdout, "WARNING") {
+		t.Errorf("loopback listen must not warn:\n%s", stdout)
+	}
+}
+
+func TestRemoteListenWarningTable(t *testing.T) {
+	cases := map[string]bool{
+		"127.0.0.1:7878":    false,
+		"localhost:7878":    false,
+		"[::1]:7878":        false,
+		"":                  false, // unknown (older api): stay quiet
+		"not-an-addr":       false,
+		"0.0.0.0:7878":      true,
+		":7878":             true,
+		"192.168.1.10:7878": true,
+	}
+	for addr, wantWarn := range cases {
+		warn := remoteListenWarning(addr)
+		if got := warn != ""; got != wantWarn {
+			t.Errorf("remoteListenWarning(%q) = %q, wantWarn = %v", addr, warn, wantWarn)
+		}
+	}
+}
