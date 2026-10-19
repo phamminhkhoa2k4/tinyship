@@ -65,15 +65,18 @@ func (w *Wrapper) CheckEngine(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("docker: daemon unreachable: %w", err)
 	}
-	if !apiAtLeast(ping.APIVersion, MinEngineAPI) {
+	if !APIAtLeast(ping.APIVersion, MinEngineAPI) {
 		return fmt.Errorf("docker: engine API %s is older than the required %s (install Docker Engine >= 24.0)",
 			ping.APIVersion, MinEngineAPI)
 	}
 	return nil
 }
 
-// apiAtLeast compares dotted numeric API versions (e.g. "1.43" <= "1.56").
-func apiAtLeast(got, want string) bool {
+// APIAtLeast compares dotted numeric API versions (e.g. "1.43" <= "1.56").
+// The diagnosis commands compare observed versions with MinEngineAPI
+// through it, so one comparison rule serves the startup gate and
+// doctor alike.
+func APIAtLeast(got, want string) bool {
 	g, w := strings.Split(got, "."), strings.Split(want, ".")
 	for i := 0; i < len(w); i++ {
 		var gv, wv int
