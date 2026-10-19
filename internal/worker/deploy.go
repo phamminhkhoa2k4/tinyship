@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/tinyship/tinyship/internal/appconfig"
@@ -300,7 +302,21 @@ func (p *Deployer) pipeline(ctx context.Context, d *deployRun, log *slog.Logger)
 
 // step runs one pipeline step, appending start/ok/fail timeline events.
 // The returned error always carries step + code.
+// crashPoint reports whether the test-only TINYSHIP_CRASH_AT variable
+// names this pipeline step. The reliability harness sets it to kill
+// the worker at a chosen step and prove the job lease expires and a
+// re-run converges; production units never set it, so it is inert.
+func crashPoint(step string) bool {
+	want := os.Getenv("TINYSHIP_CRASH_AT")
+	return want != "" && want == step
+}
+
 func (p *Deployer) step(ctx context.Context, d *deployRun, name string, fn func() (any, error)) error {
+	if crashPoint(name) {
+		// Test-only fault injection: die before the step runs so the
+		// harness observes a mid-pipeline crash, not a step failure.
+		_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+	}
 	start := time.Now()
 	_ = p.Store.AppendDeploymentEvent(ctx, d.dep.ID, name, store.EvStart, nil)
 
