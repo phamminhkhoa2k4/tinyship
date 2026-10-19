@@ -26,6 +26,7 @@ import (
 	"strings"
 
 	"github.com/tinyship/tinyship/internal/policy"
+	"github.com/tinyship/tinyship/internal/upgrade"
 )
 
 // uninstallRoot returns the install root prefix for an uninstall run:
@@ -217,12 +218,18 @@ so a later install resumes where this one stopped.
 	// Control plane on every run: units, the proxy drop-in, the tmpfiles
 	// snippet, the binary. The binary is removed last so this process
 	// keeps running from the unlinked inode (Linux allows that; the
-	// kernel holds the code).
+	// kernel holds the code). Upgrade leftovers live next to the binary
+	// and go with it: .prev is the rollback copy, .next and .next.part
+	// the staged candidate from an interrupted upgrade.
 	kill := append([]string{}, unitPaths...)
 	kill = append(kill, dropinPath, tmpfilesPath)
 	if *purge {
 		kill = append(kill, etcPath, dataPath, runPath, baselinePath)
 	}
+	kill = append(kill,
+		binaryPath+upgrade.PrevSuffix,
+		binaryPath+upgrade.NextSuffix,
+		binaryPath+upgrade.NextSuffix+".part")
 	kill = append(kill, binaryPath)
 	if err := removePaths(stdout, stderr, kill...); err != nil {
 		fmt.Fprintf(stderr, "tinyship uninstall: %v\n", err)

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/tinyship/tinyship/internal/policy"
+	"github.com/tinyship/tinyship/internal/upgrade"
 )
 
 // dockerRecorder stands in for the Docker phase so the command logic is
@@ -210,6 +211,43 @@ func TestUninstallPurgeYesRemovesOnlyWhatWasListed(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "left untouched") {
 		t.Errorf("purge must state what it never touches:\n%s", stdout)
+	}
+}
+
+// TestUninstallRemovesUpgradeLeftovers proves the rollback copy and
+// staged candidate an interrupted upgrade leaves next to the binary go
+// away with it: purge must return the host to its pre-install shape,
+// and even the keep-data run must not strand a second copy of the
+// binary in /usr/local/bin.
+func TestUninstallRemovesUpgradeLeftovers(t *testing.T) {
+	stubDocker(t, nil, nil, false, nil)
+	for _, mode := range []string{"default", "purge"} {
+		root := filepath.Join(t.TempDir(), "install-root")
+		fakeInstall(t, root)
+		bin := filepath.Join(root, "usr/local/bin/tinyship")
+		leftovers := []string{
+			bin + upgrade.PrevSuffix,
+			bin + upgrade.NextSuffix,
+			bin + upgrade.NextSuffix + ".part",
+		}
+		for _, p := range leftovers {
+			if err := os.WriteFile(p, []byte("leftover"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		args := []string{"uninstall", "--yes", "--install-root", root}
+		if mode == "purge" {
+			args = []string{"uninstall", "--purge", "--yes", "--install-root", root}
+		}
+		code, _, stderr := run(t, args...)
+		if code != 0 {
+			t.Fatalf("%s uninstall: exit = %d, stderr = %q", mode, code, stderr)
+		}
+		for _, p := range leftovers {
+			if present(p) {
+				t.Errorf("%s uninstall kept the upgrade leftover %s", mode, p)
+			}
+		}
 	}
 }
 
