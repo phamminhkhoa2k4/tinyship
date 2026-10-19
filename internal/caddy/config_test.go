@@ -113,8 +113,9 @@ func TestBuildServerOptions(t *testing.T) {
 		t.Error("zero options must not emit a TLS connection policy")
 	}
 
-	// The test-CA profile terminates TLS on the same high port; the
-	// automation policy itself lives in the base config, not here.
+	// The test-CA profile terminates TLS on the same high port and
+	// gives up the port-80 redirect listener such hosts do not own;
+	// the automation policy itself lives in the base config, not here.
 	tlsSrv, err := BuildServer(rows, BuildOptions{Listen: ":8443", ServeTLS: true})
 	if err != nil {
 		t.Fatalf("BuildServer serve-TLS: %v", err)
@@ -126,8 +127,12 @@ func TestBuildServerOptions(t *testing.T) {
 	if raw, _ := json.Marshal(pol); string(raw) != "[{}]" {
 		t.Errorf("connection policies = %s, want [{}] (an empty policy marks the server TLS)", raw)
 	}
-	if _, present := tlsSrv["automatic_https"]; present {
-		t.Error("ServeTLS must leave automatic HTTPS at the base config's default")
+	ah, present := tlsSrv["automatic_https"]
+	if !present {
+		t.Fatal("ServeTLS must keep Caddy off the port-80 redirect listener")
+	}
+	if raw, _ := json.Marshal(ah); string(raw) != `{"disable_redirects":true}` {
+		t.Errorf("automatic_https = %s, want disable_redirects", raw)
 	}
 }
 

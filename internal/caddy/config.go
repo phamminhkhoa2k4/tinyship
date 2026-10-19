@@ -38,10 +38,13 @@ type BuildOptions struct {
 	// ACME endpoints cannot obtain one, and the attempt would stall
 	// the route.
 	DisableAutoHTTPS bool
-	// ServeTLS emits the empty connection policy that makes the server
-	// terminate TLS even on a non-443 listener. Test hosts pair it with
-	// an internal issuer configured in the base config; installed hosts
-	// leave it unset and keep Caddy's automatic HTTPS defaults.
+	// ServeTLS emits the test-host TLS profile: the empty connection
+	// policy that makes the server terminate TLS even on a non-443
+	// listener, plus the switch that keeps Caddy from binding a
+	// redirect listener on port 80, which such hosts do not own. The
+	// certificate issuer is supplied by the base config (a test CA);
+	// installed hosts leave this unset and keep Caddy's automatic
+	// HTTPS defaults.
 	ServeTLS bool
 }
 
@@ -108,6 +111,7 @@ func BuildServer(rows []store.RouteRow, opts BuildOptions) (map[string]any, erro
 	}
 	if opts.ServeTLS {
 		server["tls_connection_policies"] = []any{map[string]any{}}
+		server["automatic_https"] = map[string]any{"disable_redirects": true}
 	}
 	return server, nil
 }
