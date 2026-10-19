@@ -137,66 +137,17 @@ passphrase is read from stdin so it never lands in shell history.
 		return 1
 	}
 
-	dbPath, configPath, keysDir, tokenPath, outDir := backupPaths(root)
+	dbPath, _, _, _, outDir := backupPaths(root)
 	if _, err := os.Stat(dbPath); err != nil {
 		fmt.Fprintf(stderr, "tinyship backup: no database at %s; install first\n", dbPath)
 		return 1
 	}
 
-	// Snapshot without migrating: a backup must not change the state it
-	// is preserving. The applied schema version is read from the data,
-	// so the manifest describes the snapshot, not this binary.
-	s, err := store.OpenPlain(dbPath)
+	files, schema, missing, err := collectBackupFiles(ctx, root)
 	if err != nil {
-		fmt.Fprintf(stderr, "tinyship backup: open database %s: %v\n", dbPath, err)
-		return 1
-	}
-	schema, err := s.AppliedSchemaVersion(ctx)
-	if err != nil {
-		s.Close()
 		fmt.Fprintf(stderr, "tinyship backup: %v\n", err)
 		return 1
 	}
-	tmp, err := os.MkdirTemp("", "tinyship-backup-")
-	if err != nil {
-		s.Close()
-		fmt.Fprintf(stderr, "tinyship backup: %v\n", err)
-		return 1
-	}
-	defer os.RemoveAll(tmp)
-	snapPath := filepath.Join(tmp, "tinyship.db")
-	if err := s.Snapshot(ctx, snapPath); err != nil {
-		s.Close()
-		fmt.Fprintf(stderr, "tinyship backup: %v\n", err)
-		return 1
-	}
-	if err := s.Close(); err != nil {
-		fmt.Fprintf(stderr, "tinyship backup: close database: %v\n", err)
-		return 1
-	}
-
-	files := []backup.File{{Name: "var/lib/tinyship/tinyship.db"}}
-	var missing []string
-	optional := []struct{ name, path string }{
-		{"etc/tinyship/config.yaml", configPath},
-		{"etc/tinyship/keys/secrets.key", filepath.Join(keysDir, "secrets.key")},
-		{"etc/tinyship/keys/secrets.pub", filepath.Join(keysDir, "secrets.pub")},
-		{"etc/tinyship/token", tokenPath},
-	}
-	for _, f := range optional {
-		data, err := os.ReadFile(f.path)
-		if err != nil {
-			missing = append(missing, f.path)
-			continue
-		}
-		files = append(files, backup.File{Name: f.name, Data: data})
-	}
-	snap, err := os.ReadFile(snapPath)
-	if err != nil {
-		fmt.Fprintf(stderr, "tinyship backup: read snapshot: %v\n", err)
-		return 1
-	}
-	files[0].Data = snap
 
 	target := *out
 	if target == "" {
@@ -216,14 +167,7 @@ passphrase is read from stdin so it never lands in shell history.
 		fmt.Fprintf(stderr, "tinyship backup: create %s: %v\n", target, err)
 		return 1
 	}
-	hostname, _ := os.Hostname()
-	manifest, err := backup.Write(f, backup.Options{
-		Files:           files,
-		Passphrase:      passphrase,
-		TinyshipVersion: version.Version,
-		SchemaVersion:   schema,
-		Hostname:        hostname,
-	})
+	manifest, err := writeBackupArchive(f, files, schema, passphrase)
 	if err != nil {
 		f.Close()
 		os.Remove(target)
@@ -241,6 +185,99 @@ passphrase is read from stdin so it never lands in shell history.
 		return 1
 	}
 	return reportBackup(target, manifest, missing, *jsonOut, stdout, stderr)
+}
+
+// collectBackupFiles gathers the archive members for a backup of the
+// install at root: the database snapshot (required) plus the host
+// configuration, key pair and admin token when present. The snapshot is
+// taken without migrating: a backup must not change the state it is
+// preserving, and the manifest records the applied schema read from the
+// data rather than this binary's idea of it.
+func collectBackupFiles(ctx context.Context, root string) (files []backup.File, schema int, missing []string, err error) {
+	dbPath, configPath, keysDir, tokenPath, _ := backupPaths(root)
+	s, err := store.OpenPlain(dbPath)
+	if err != nil {
+		return nil, 0, nil, fmt.Errorf("open database %s: %w", dbPath, err)
+	}
+	defer s.Close()
+	schema, err = s.AppliedSchemaVersion(ctx)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	tmp, err := os.MkdirTemp("", "tinyship-backup-")
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	defer os.RemoveAll(tmp)
+	snapPath := filepath.Join(tmp, "tinyship.db")
+	if err := s.Snapshot(ctx, snapPath); err != nil {
+		return nil, 0, nil, err
+	}
+	snap, err := os.ReadFile(snapPath)
+	if err != nil {
+		return nil, 0, nil, fmt.Errorf("read snapshot: %w", err)
+	}
+	files = []backup.File{{Name: "var/lib/tinyship/tinyship.db", Data: snap}}
+	optional := []struct{ name, path string }{
+		{"etc/tinyship/config.yaml", configPath},
+		{"etc/tinyship/keys/secrets.key", filepath.Join(keysDir, "secrets.key")},
+		{"etc/tinyship/keys/secrets.pub", filepath.Join(keysDir, "secrets.pub")},
+		{"etc/tinyship/token", tokenPath},
+	}
+	for _, f := range optional {
+		data, err := os.ReadFile(f.path)
+		if err != nil {
+			missing = append(missing, f.path)
+			continue
+		}
+		files = append(files, backup.File{Name: f.name, Data: data})
+	}
+	return files, schema, missing, nil
+}
+
+// writeBackupArchive serializes the members into an archive on w.
+func writeBackupArchive(w io.Writer, files []backup.File, schema int, passphrase string) (*backup.Manifest, error) {
+	hostname, _ := os.Hostname()
+	return backup.Write(w, backup.Options{
+		Files:           files,
+		Passphrase:      passphrase,
+		TinyshipVersion: version.Version,
+		SchemaVersion:   schema,
+		Hostname:        hostname,
+	})
+}
+
+// writeBackupAtomic writes a backup archive to path via a temporary
+// file so an interrupted run never leaves a plausible-looking archive
+// under the final name; a re-run would otherwise reuse a half-written
+// file as if it were intact.
+func writeBackupAtomic(ctx context.Context, root, path string) error {
+	files, schema, _, err := collectBackupFiles(ctx, root)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := writeBackupArchive(f, files, schema, ""); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // reportBackup prints the human summary (or JSON) plus the two standing

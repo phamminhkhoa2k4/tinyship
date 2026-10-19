@@ -10,6 +10,7 @@ import (
 	"os"
 	"text/tabwriter"
 
+	"github.com/tinyship/tinyship/internal/store"
 	"github.com/tinyship/tinyship/internal/version"
 )
 
@@ -45,6 +46,8 @@ func RunWithIO(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		return cmdBackup(ctx, args[1:], stdout, stderr)
 	case "restore":
 		return cmdRestore(ctx, args[1:], stdout, stderr)
+	case "upgrade":
+		return cmdUpgrade(ctx, args[1:], stdout, stderr)
 	case "deploy":
 		return cmdDeploy(ctx, args[1:], stdout, stderr)
 	case "rollback":
@@ -118,6 +121,7 @@ Commands:
   uninstall     Remove the control plane (root; --purge for everything)
   backup        Write one backup file: DB snapshot, config, keys, token (root)
   restore       Restore a backup file and report which apps need a deploy (root)
+  upgrade       Replace the binary with a checksummed build, with rollback (root)
   version       Print binary, commit, and DB schema versions
   help          Show this help
 
@@ -170,14 +174,32 @@ func cmdVersion(args []string, stdout, stderr io.Writer) int {
 }
 
 func cmdVersionJSON(stdout io.Writer, stderr io.Writer) int {
+	// The migration list rides along so an upgrade running against a
+	// freshly downloaded build can report exactly which migrations it
+	// will apply without guessing from schema numbers alone.
 	out := struct {
-		Version       string `json:"version"`
-		Commit        string `json:"commit"`
-		SchemaVersion int    `json:"schema_version"`
-	}{version.Version, version.Commit, version.SchemaVersion}
+		Version       string   `json:"version"`
+		Commit        string   `json:"commit"`
+		SchemaVersion int      `json:"schema_version"`
+		Migrations    []string `json:"migrations,omitempty"`
+	}{version.Version, version.Commit, version.SchemaVersion, cliMigrationNames()}
 	if err := json.NewEncoder(stdout).Encode(out); err != nil {
 		fmt.Fprintf(stderr, "tinyship version: %v\n", err)
 		return 1
 	}
 	return 0
+}
+
+// cliMigrationNames renders the embedded migrations as "NNNN_name",
+// the same shape the upgrade report uses for pending migrations.
+func cliMigrationNames() []string {
+	migrations, err := store.Migrations()
+	if err != nil {
+		return nil
+	}
+	names := make([]string, 0, len(migrations))
+	for _, m := range migrations {
+		names = append(names, fmt.Sprintf("%04d_%s", m.Version, m.Name))
+	}
+	return names
 }
