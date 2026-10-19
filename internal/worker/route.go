@@ -2,12 +2,14 @@ package worker
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/tinyship/tinyship/internal/caddy"
@@ -37,18 +39,36 @@ const DefaultProbeAddr = "127.0.0.1:80"
 // DefaultProbe sends one request through the loopback proxy listener
 // with the hostname as the Host header: routing is proven even before
 // public DNS or certificates exist, which is exactly the final check's
-// job after a route switch.
+// job after a route switch. The probe address may be a full URL; an
+// https:// address switches the scheme so test hosts can check routing
+// through a TLS-terminating proxy.
 func DefaultProbe(ctx context.Context, hostname string) (int, error) {
 	addr := os.Getenv("TINYSHIP_CADDY_PROBE")
 	if addr == "" {
 		addr = DefaultProbeAddr
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/", nil)
+	scheme := "http"
+	target := addr
+	if rest, ok := strings.CutPrefix(addr, "https://"); ok {
+		scheme, target = "https", rest
+	} else if rest, ok := strings.CutPrefix(addr, "http://"); ok {
+		target = rest
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, scheme+"://"+target+"/", nil)
 	if err != nil {
 		return 0, err
 	}
 	req.Host = hostname
 	client := &http.Client{Timeout: 10 * time.Second}
+	if scheme == "https" {
+		// This probe proves routing, not certificate identity: the
+		// loopback target presents whatever issuer the test host
+		// configured, and trust-store contents must not decide whether
+		// a route switch counts as healthy.
+		client.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // routing probe by design
+		}
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, err
@@ -103,14 +123,20 @@ func RegenerateRoutes(ctx context.Context, s *store.Store, cc Caddy, log *slog.L
 // TINYSHIP_CADDY_LISTEN and TINYSHIP_CADDY_AUTO_HTTPS=off exist for
 // development and test hosts: they cannot bind privileged ports and
 // have no public DNS, so the proxy listens on a high port with
-// certificate automation disabled. Installed hosts use the defaults.
+// certificate automation disabled. TINYSHIP_CADDY_AUTO_HTTPS=internal
+// is the test-CA profile: keep automation on and terminate TLS on the
+// high port while the base config supplies an internal issuer.
+// Installed hosts use the defaults.
 func buildOptions(ov *caddy.Override) caddy.BuildOptions {
 	opts := caddy.BuildOptions{Override: ov}
 	if v := os.Getenv("TINYSHIP_CADDY_LISTEN"); v != "" {
 		opts.Listen = v
 	}
-	if os.Getenv("TINYSHIP_CADDY_AUTO_HTTPS") == "off" {
+	switch os.Getenv("TINYSHIP_CADDY_AUTO_HTTPS") {
+	case "off":
 		opts.DisableAutoHTTPS = true
+	case "internal":
+		opts.ServeTLS = true
 	}
 	return opts
 }

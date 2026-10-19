@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
@@ -197,15 +199,61 @@ func TestDeployRouteSwitchRetriesWhenCaddyUnreachable(t *testing.T) {
 func TestBuildOptionsFromEnv(t *testing.T) {
 	// Installed-host defaults: no env set.
 	opts := buildOptions(nil)
-	if opts.Listen != "" || opts.DisableAutoHTTPS || opts.Override != nil {
+	if opts.Listen != "" || opts.DisableAutoHTTPS || opts.ServeTLS || opts.Override != nil {
 		t.Errorf("zero env = %+v, want zero options", opts)
 	}
 
 	t.Setenv("TINYSHIP_CADDY_LISTEN", ":8443")
 	t.Setenv("TINYSHIP_CADDY_AUTO_HTTPS", "off")
 	opts = buildOptions(&caddy.Override{AppID: "appA", HostPort: 20017})
-	if opts.Listen != ":8443" || !opts.DisableAutoHTTPS || opts.Override == nil {
+	if opts.Listen != ":8443" || !opts.DisableAutoHTTPS || opts.ServeTLS || opts.Override == nil {
 		t.Errorf("env options = %+v, want listen :8443, auto-https off, override kept", opts)
+	}
+
+	// The test-CA profile: automation stays on, the server terminates
+	// TLS, and the override survives.
+	t.Setenv("TINYSHIP_CADDY_AUTO_HTTPS", "internal")
+	opts = buildOptions(&caddy.Override{AppID: "appA", HostPort: 20017})
+	if opts.Listen != ":8443" || opts.DisableAutoHTTPS || !opts.ServeTLS || opts.Override == nil {
+		t.Errorf("internal options = %+v, want listen :8443, TLS served, override kept", opts)
+	}
+}
+
+func TestDefaultProbeSwitchesToTLSWithAURL(t *testing.T) {
+	var seenHost string
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenHost = r.Host
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer ts.Close()
+
+	// httptest's URL is https://127.0.0.1:<port>; the probe trusts the
+	// routing, not the issuer, so the self-signed certificate must not
+	// matter.
+	t.Setenv("TINYSHIP_CADDY_PROBE", ts.URL)
+	got, err := DefaultProbe(context.Background(), "app.example.test")
+	if err != nil {
+		t.Fatalf("DefaultProbe over https: %v", err)
+	}
+	if got != http.StatusTeapot {
+		t.Errorf("probe status = %d, want %d", got, http.StatusTeapot)
+	}
+	if seenHost != "app.example.test" {
+		t.Errorf("Host header = %q, want the routed hostname", seenHost)
+	}
+
+	// An explicit http:// prefix keeps the plain scheme.
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer plain.Close()
+	t.Setenv("TINYSHIP_CADDY_PROBE", plain.URL)
+	got, err = DefaultProbe(context.Background(), "app.example.test")
+	if err != nil {
+		t.Fatalf("DefaultProbe over http: %v", err)
+	}
+	if got != http.StatusOK {
+		t.Errorf("http probe status = %d, want 200", got)
 	}
 }
 

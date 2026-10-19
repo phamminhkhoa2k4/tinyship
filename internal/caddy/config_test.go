@@ -109,6 +109,26 @@ func TestBuildServerOptions(t *testing.T) {
 	if len(def["routes"].([]any)) != len(dev["routes"].([]any)) {
 		t.Error("dev options changed the route set")
 	}
+	if _, present := def["tls_connection_policies"]; present {
+		t.Error("zero options must not emit a TLS connection policy")
+	}
+
+	// The test-CA profile terminates TLS on the same high port; the
+	// automation policy itself lives in the base config, not here.
+	tlsSrv, err := BuildServer(rows, BuildOptions{Listen: ":8443", ServeTLS: true})
+	if err != nil {
+		t.Fatalf("BuildServer serve-TLS: %v", err)
+	}
+	pol, present := tlsSrv["tls_connection_policies"]
+	if !present {
+		t.Fatal("ServeTLS must emit tls_connection_policies")
+	}
+	if raw, _ := json.Marshal(pol); string(raw) != "[{}]" {
+		t.Errorf("connection policies = %s, want [{}] (an empty policy marks the server TLS)", raw)
+	}
+	if _, present := tlsSrv["automatic_https"]; present {
+		t.Error("ServeTLS must leave automatic HTTPS at the base config's default")
+	}
 }
 
 func TestBuildServerRejectsBadRows(t *testing.T) {
