@@ -1,6 +1,8 @@
 package policy
 
 import (
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -123,39 +125,96 @@ func TestBuildRejectsHostPortOutsideRange(t *testing.T) {
 	}
 }
 
-// TestForbiddenParametersAreUnrepresentable is the structural proof for
-// there is no field on ContainerSpec for privileged mode, host
-// networking, devices, host binds, or arbitrary sysctls — a hostile config
-// cannot express them at all.
+// TestForbiddenParametersAreUnrepresentable proves, per forbidden
+// parameter, that the closed spec cannot express it: a hostile config
+// has no field to carry it, so it can never reach Docker. Each table
+// entry names the fields that would have to exist for the parameter to
+// be expressible; if a refactor adds one, the test fails loudly so the
+// allowlist decision is re-made deliberately.
 func TestForbiddenParametersAreUnrepresentable(t *testing.T) {
-	// The closed spec has no fields named for forbidden capabilities; if a
-	// refactor adds one, fail loudly so the allowlist decision is re-made
-	// deliberately (E_POLICY_FORBIDDEN_PARAM).
-	spec, err := Build(validConfig(), validInstance())
-	if err != nil {
-		t.Fatalf("Build: %v", err)
+	specType := reflect.TypeOf(ContainerSpec{})
+	forbidden := []struct {
+		param  string   // the always-rejected parameter
+		fields []string // spec fields that would make it expressible
+	}{
+		{"privileged mode", []string{"Privileged"}},
+		{"host networking", []string{"HostNetwork"}},
+		{"host pid namespace", []string{"PidMode"}},
+		{"host ipc namespace", []string{"IpcMode"}},
+		{"host devices", []string{"Devices", "DeviceCgroupRules"}},
+		{"arbitrary sysctls", []string{"Sysctls"}},
+		{"extra host entries", []string{"ExtraHosts"}},
+		{"published-all ports", []string{"PublishAllPorts"}},
+		{"host bind mounts", []string{"Binds", "BindMounts", "Mounts"}},
+		{"docker socket mount", []string{"SocketPath"}},
 	}
-	// CapAdd must be empty for a config without cap_add.
-	if len(spec.CapAdd) != 0 {
-		t.Errorf("CapAdd = %v, want empty", spec.CapAdd)
+	for _, tc := range forbidden {
+		t.Run(tc.param, func(t *testing.T) {
+			for _, field := range tc.fields {
+				if _, ok := specType.FieldByName(field); ok {
+					t.Errorf("ContainerSpec has field %q: %s is now expressible; "+
+						"add it through the allowlist on purpose or remove it", field, tc.param)
+				}
+			}
+		})
 	}
 
-	// sane() is the invariant tripwire: flip the baseline and it must fire.
-	broken := *spec
-	broken.CapDropALL = false
-	if err := broken.sane(); err == nil {
-		t.Error("sane() must reject CapDropALL=false")
-	}
-	broken = *spec
-	broken.Network = "host"
-	if err := broken.sane(); err == nil {
-		t.Error("sane() must reject network=host")
-	}
-	broken = *spec
-	broken.CapAdd = []string{"NET_ADMIN"}
-	if err := broken.sane(); err == nil {
-		t.Error("sane() must reject NET_ADMIN")
-	}
+	t.Run("named volume mounts carry no host source", func(t *testing.T) {
+		// A VolumeMount references a TinyShip-managed volume by name
+		// only; there is no field for a host path, so a mount can never
+		// point at /var/run/docker.sock or any other host directory.
+		want := []string{"Name", "Path", "ReadOnly"}
+		var got []string
+		vt := reflect.TypeOf(VolumeMount{})
+		for i := 0; i < vt.NumField(); i++ {
+			got = append(got, vt.Field(i).Name)
+		}
+		sort.Strings(got)
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("VolumeMount fields = %v, want exactly %v", got, want)
+		}
+	})
+
+	t.Run("dangerous capabilities are refused by Build", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.CapAdd = []string{"SYS_ADMIN"}
+		if _, err := Build(cfg, validInstance()); err == nil ||
+			!strings.Contains(err.Error(), "allowlist") {
+			t.Errorf("Build with CAP_SYS_ADMIN = %v, want allowlist refusal", err)
+		}
+	})
+
+	t.Run("baseline hardening cannot be weakened", func(t *testing.T) {
+		spec, err := Build(validConfig(), validInstance())
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		// CapAdd must be empty for a config without cap_add.
+		if len(spec.CapAdd) != 0 {
+			t.Errorf("CapAdd = %v, want empty", spec.CapAdd)
+		}
+		// sane() is the invariant tripwire: flip the baseline and it fires.
+		broken := *spec
+		broken.CapDropALL = false
+		if err := broken.sane(); err == nil {
+			t.Error("sane() must reject CapDropALL=false")
+		}
+		broken = *spec
+		broken.Network = "host"
+		if err := broken.sane(); err == nil {
+			t.Error("sane() must reject network=host")
+		}
+		broken = *spec
+		broken.CapAdd = []string{"NET_ADMIN"}
+		if err := broken.sane(); err == nil {
+			t.Error("sane() must reject NET_ADMIN")
+		}
+		broken = *spec
+		broken.NoNewPrivs = false
+		if err := broken.sane(); err == nil {
+			t.Error("sane() must reject no-new-privileges=false")
+		}
+	})
 }
 
 func TestDockerVolumeNameIsDerived(t *testing.T) {

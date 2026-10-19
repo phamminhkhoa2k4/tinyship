@@ -531,6 +531,18 @@ func TestDeployRejectsBadPayloads(t *testing.T) {
 		"unknown field":   `{"deployment_id":"x","sudo":true}`,
 		"unknown dep ref": fmt.Sprintf(`{"deployment_id":%q}`, store.NewID()),
 		"trailing":        `{"deployment_id":"x"} 1`,
+		// A hostile payload trying to smuggle a forbidden container
+		// parameter: the strict decoder refuses unknown fields, so each
+		// one fails validation before any side effect.
+		"privileged mode":     `{"deployment_id":"x","privileged":true}`,
+		"host networking":     `{"deployment_id":"x","network_mode":"host"}`,
+		"host pid namespace":  `{"deployment_id":"x","pid_mode":"host"}`,
+		"host ipc namespace":  `{"deployment_id":"x","ipc_mode":"host"}`,
+		"host bind mount":     `{"deployment_id":"x","binds":["/var/run/docker.sock:/var/run/docker.sock"]}`,
+		"docker socket mount": `{"deployment_id":"x","socket_path":"/var/run/docker.sock"}`,
+		"dangerous caps":      `{"deployment_id":"x","cap_add":["SYS_ADMIN"]}`,
+		"host devices":        `{"deployment_id":"x","devices":["/dev/sda"]}`,
+		"arbitrary sysctls":   `{"deployment_id":"x","sysctls":{"net.ipv4.ip_forward":"1"}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newDeployFixture(t, happyConfig)
