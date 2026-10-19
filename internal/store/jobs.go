@@ -135,6 +135,24 @@ type CreateJobInput struct {
 // duplicate arrives. The unique index jobs_idem is the
 // authority; this method handles the race by re-selecting on conflict.
 func (s *Store) CreateJob(ctx context.Context, in CreateJobInput) (*Job, error) {
+	var out *Job
+	err := s.WithTx(ctx, func(tx *sql.Tx) error {
+		j, err := createJob(ctx, tx, in)
+		if err != nil {
+			return err
+		}
+		out = j
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// createJob is CreateJob's body against one transaction, so a job can
+// be committed together with rows it must never be visible without.
+func createJob(ctx context.Context, tx *sql.Tx, in CreateJobInput) (*Job, error) {
 	if in.Type == "" {
 		return nil, errors.New("store: job type is required")
 	}
@@ -149,37 +167,33 @@ func (s *Store) CreateJob(ctx context.Context, in CreateJobInput) (*Job, error) 
 	id := NewID()
 
 	var out Job
-	err := s.WithTx(ctx, func(tx *sql.Tx) error {
-		if in.IdempotencyKey != nil && *in.IdempotencyKey != "" {
-			existing, err := findIdempotent(ctx, tx, in.AppID, *in.IdempotencyKey)
-			if err != nil {
-				return err
-			}
-			if existing != nil {
-				out = *existing
-				return nil
-			}
+	if in.IdempotencyKey != nil && *in.IdempotencyKey != "" {
+		existing, err := findIdempotent(ctx, tx, in.AppID, *in.IdempotencyKey)
+		if err != nil {
+			return nil, err
 		}
-		var appID any
-		if in.AppID != nil {
-			appID = *in.AppID
+		if existing != nil {
+			return existing, nil
 		}
-		var idemKey any
-		if in.IdempotencyKey != nil && *in.IdempotencyKey != "" {
-			idemKey = *in.IdempotencyKey
-		}
-		_, err := tx.ExecContext(ctx, `
+	}
+	var appID any
+	if in.AppID != nil {
+		appID = *in.AppID
+	}
+	var idemKey any
+	if in.IdempotencyKey != nil && *in.IdempotencyKey != "" {
+		idemKey = *in.IdempotencyKey
+	}
+	_, err := tx.ExecContext(ctx, `
 INSERT INTO jobs(id, app_id, type, state, payload_json, attempts, max_attempts,
                  next_run_at, idempotency_key, created_by, created_at, updated_at)
 VALUES(?,?,?,'queued',?,0,?,?,?,?,?,?)`,
-			id, appID, in.Type, in.PayloadJSON, in.MaxAttempts,
-			next, idemKey, in.CreatedBy, now, now)
-		if err != nil {
-			return fmt.Errorf("store: insert job: %w", err)
-		}
-		return scanJob(ctx, tx.QueryRowContext(ctx, jobSelect+" WHERE id = ?", id), &out)
-	})
+		id, appID, in.Type, in.PayloadJSON, in.MaxAttempts,
+		next, idemKey, in.CreatedBy, now, now)
 	if err != nil {
+		return nil, fmt.Errorf("store: insert job: %w", err)
+	}
+	if err := scanJob(ctx, tx.QueryRowContext(ctx, jobSelect+" WHERE id = ?", id), &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

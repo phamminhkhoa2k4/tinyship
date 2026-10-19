@@ -535,26 +535,25 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	if body.Force {
 		payload = fmt.Sprintf(`{"deployment_id":%q,"force":true}`, depID)
 	}
-	job, err := s.store.CreateJob(r.Context(), store.CreateJobInput{
-		AppID:       &app.ID,
-		Type:        worker.DeployJobType,
-		PayloadJSON: payload,
-		CreatedBy:   "api",
-	})
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "E_INTERNAL", err.Error())
-		return
-	}
-	dep, err := s.store.CreateDeployment(r.Context(), store.CreateDeploymentInput{
-		ID:                   depID,
-		AppID:                app.ID,
-		JobID:                job.ID,
-		Kind:                 "deploy",
-		ImageRef:             imageRef(cfg),
-		ConfigSnapshotJSON:   app.ConfigJSON,
-		ConfigVersion:        app.ConfigVersion,
-		PreviousDeploymentID: app.CurrentDeploymentID,
-	})
+	// One transaction: the worker claims jobs in a poll loop, and a
+	// job visible before its deployment row exists fails the pipeline
+	// at its first lookup.
+	dep, job, err := s.store.CreateDeploymentJob(r.Context(),
+		store.CreateDeploymentInput{
+			ID:                   depID,
+			AppID:                app.ID,
+			Kind:                 "deploy",
+			ImageRef:             imageRef(cfg),
+			ConfigSnapshotJSON:   app.ConfigJSON,
+			ConfigVersion:        app.ConfigVersion,
+			PreviousDeploymentID: app.CurrentDeploymentID,
+		},
+		store.CreateJobInput{
+			AppID:       &app.ID,
+			Type:        worker.DeployJobType,
+			PayloadJSON: payload,
+			CreatedBy:   "api",
+		})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "E_INTERNAL", err.Error())
 		return

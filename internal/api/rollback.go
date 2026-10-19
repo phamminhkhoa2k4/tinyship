@@ -83,27 +83,25 @@ func (s *server) handleRollback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	depID := store.NewID()
-	job, err := s.store.CreateJob(r.Context(), store.CreateJobInput{
-		AppID:       &app.ID,
-		Type:        worker.DeployJobType,
-		PayloadJSON: fmt.Sprintf(`{"deployment_id":%q}`, depID),
-		CreatedBy:   "api",
-	})
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "E_INTERNAL", err.Error())
-		return
-	}
-	dep, err := s.store.CreateDeployment(r.Context(), store.CreateDeploymentInput{
-		ID:                   depID,
-		AppID:                app.ID,
-		JobID:                job.ID,
-		Kind:                 "rollback",
-		ImageRef:             cfg.Image + "@" + *target.ImageDigest,
-		ConfigSnapshotJSON:   string(snapshot),
-		ConfigVersion:        target.ConfigVersion,
-		PreviousDeploymentID: app.CurrentDeploymentID,
-		RollbackOfID:         &target.ID,
-	})
+	// One transaction, as in handleDeploy: the job must never be
+	// claimable before its deployment row exists.
+	dep, job, err := s.store.CreateDeploymentJob(r.Context(),
+		store.CreateDeploymentInput{
+			ID:                   depID,
+			AppID:                app.ID,
+			Kind:                 "rollback",
+			ImageRef:             cfg.Image + "@" + *target.ImageDigest,
+			ConfigSnapshotJSON:   string(snapshot),
+			ConfigVersion:        target.ConfigVersion,
+			PreviousDeploymentID: app.CurrentDeploymentID,
+			RollbackOfID:         &target.ID,
+		},
+		store.CreateJobInput{
+			AppID:       &app.ID,
+			Type:        worker.DeployJobType,
+			PayloadJSON: fmt.Sprintf(`{"deployment_id":%q}`, depID),
+			CreatedBy:   "api",
+		})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "E_INTERNAL", err.Error())
 		return
