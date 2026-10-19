@@ -28,6 +28,7 @@ import (
 
 	"github.com/tinyship/tinyship/internal/backup"
 	"github.com/tinyship/tinyship/internal/policy"
+	"github.com/tinyship/tinyship/internal/reconcile"
 	"github.com/tinyship/tinyship/internal/store"
 )
 
@@ -448,29 +449,10 @@ func reportReconcile(ctx context.Context, dbPath string, stdout, stderr io.Write
 		return 0
 	}
 
-	var needDeploy, upToDate, stopped []string
-	for _, app := range apps {
-		switch {
-		case app.DesiredState != "running" || app.Deleting:
-			stopped = append(stopped, app.Name)
-		case running[app.ID]:
-			upToDate = append(upToDate, app.Name)
-		default:
-			needDeploy = append(needDeploy, app.Name)
-		}
-	}
-	// Running managed containers whose app is absent from the restored
-	// database: the backup predates them. Report, never touch.
-	inDB := make(map[string]bool, len(apps))
-	for _, app := range apps {
-		inDB[app.ID] = true
-	}
-	var orphans []string
-	for id := range running {
-		if !inDB[id] {
-			orphans = append(orphans, id)
-		}
-	}
+	// The comparison itself is shared with the worker's boot report
+	// and the status output; only this rendering is restore-specific.
+	rep := reconcile.Compare(reconcile.FromStore(apps), running)
+	upToDate, needDeploy, stopped, orphans := rep.UpToDate, rep.NeedDeploy, rep.Stopped, rep.UnknownRunning
 
 	if jsonOut {
 		fmt.Fprintf(stdout, "{\"reconcile\":\"done\",\"up_to_date\":%q,\"need_deploy\":%q,\"stopped\":%q,\"unknown_running\":%q}\n",

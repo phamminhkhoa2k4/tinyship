@@ -7,6 +7,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/tinyship/tinyship/internal/appconfig"
+	"github.com/tinyship/tinyship/internal/reconcile"
 )
 
 // apiFor points the CLI at a scripted API and returns it.
@@ -500,6 +502,9 @@ func TestDeploymentsEmpty(t *testing.T) {
 // --- status ---------------------------------------------------------------------------------
 
 func TestStatusReportsHealthAndApps(t *testing.T) {
+	// Docker says nothing is running: the app listed below therefore
+	// shows up as drift, which is the point of the new line.
+	stubReconcile(t, map[string]bool{}, nil)
 	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/healthz":
@@ -521,7 +526,10 @@ func TestStatusReportsHealthAndApps(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit = %d, stderr = %q", code, stderr)
 	}
-	for _, want := range []string{"API     OK (version 0.1.0-dev, commit abc123)", "Apps    1", "web", "nginx:v1", "running"} {
+	for _, want := range []string{
+		"API     OK (version 0.1.0-dev, commit abc123)", "Apps    1",
+		"web", "nginx:v1", "running", "Drift   needs a deploy: web",
+	} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("stdout missing %q:\n%s", want, stdout)
 		}
@@ -532,14 +540,71 @@ func TestStatusReportsHealthAndApps(t *testing.T) {
 		t.Fatalf("--json exit = %d", code)
 	}
 	var got struct {
-		API  map[string]any `json:"api"`
-		Apps []any          `json:"apps"`
+		API       map[string]any `json:"api"`
+		Apps      []any          `json:"apps"`
+		Reconcile map[string]any `json:"reconcile"`
 	}
 	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
 		t.Fatalf("invalid JSON: %v (%s)", err, stdout)
 	}
 	if got.API["status"] != "ok" || len(got.Apps) != 1 {
 		t.Errorf("json = %s", stdout)
+	}
+	if got.Reconcile == nil {
+		t.Fatalf("json has no reconcile report: %s", stdout)
+	}
+	if len(got.Reconcile["need_deploy"].([]any)) != 1 {
+		t.Errorf("json reconcile = %s, want web in need_deploy", stdout)
+	}
+}
+
+func TestStatusReconcileSkipsWhenDockerIsUnavailable(t *testing.T) {
+	stubReconcile(t, nil, errors.New("docker: no daemon"))
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/healthz":
+			writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": "v", "commit": "c"})
+		case "/apps":
+			writeJSON(w, http.StatusOK, map[string]any{"apps": []map[string]any{}})
+		default:
+			writeErr(w, http.StatusNotFound, "E_NOT_FOUND", "x")
+		}
+	}))
+
+	// Status itself stays useful: the drift line says unknown instead
+	// of failing, and the exit code stays 0.
+	code, stdout, stderr := run(t, "status")
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q", code, stderr)
+	}
+	if !strings.Contains(stdout, "Drift   unknown (docker unavailable)") {
+		t.Errorf("stdout missing the unknown drift line:\n%s", stdout)
+	}
+
+	code, stdout, _ = run(t, "status", "--json")
+	if code != 0 {
+		t.Fatalf("--json exit = %d", code)
+	}
+	if !strings.Contains(stdout, `"reconcile":{"error":"docker unavailable"}`) {
+		t.Errorf("json missing the reconcile error marker: %s", stdout)
+	}
+}
+
+func TestDriftSummaryCategories(t *testing.T) {
+	if got := driftSummary(reconcile.Report{}); got != "none" {
+		t.Errorf("empty report = %q, want none", got)
+	}
+	r := reconcile.Report{
+		NeedDeploy:     []string{"web"},
+		UnknownRunning: []string{"ctr-1"},
+		Stopped:        []string{"old"}, // intentional state, not drift
+	}
+	got := driftSummary(r)
+	if !strings.Contains(got, "needs a deploy: web") || !strings.Contains(got, "running but unknown: ctr-1") {
+		t.Errorf("summary = %q, want both drift categories", got)
+	}
+	if strings.Contains(got, "old") {
+		t.Errorf("summary = %q, must not list a deliberately stopped app", got)
 	}
 }
 
@@ -856,6 +921,9 @@ func TestRollbackRequiresOneAppName(t *testing.T) {
 // tcp_listen value.
 func statusAPI(t *testing.T, tcpListen string) {
 	t.Helper()
+	// Deterministic drift line: the docker lookup is stubbed so these
+	// warning assertions never depend on the host's containers.
+	stubReconcile(t, map[string]bool{}, nil)
 	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/healthz":

@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/tinyship/tinyship/internal/appconfig"
+	"github.com/tinyship/tinyship/internal/reconcile"
 )
 
 // flagSet builds a flag set that prints usage to stderr and maps -h to the
@@ -695,22 +696,23 @@ func cmdStatus(ctx context.Context, args []string, stdout, stderr io.Writer) int
 			c.base, err)
 		return 1
 	}
-	var apps struct {
-		Apps []struct {
-			Name                string  `json:"name"`
-			Image               string  `json:"image"`
-			Tag                 string  `json:"tag"`
-			DesiredState        string  `json:"desired_state"`
-			CurrentDeploymentID *string `json:"current_deployment_id"`
-		} `json:"apps"`
-	}
-	if err := c.doJSON(ctx, http.MethodGet, "/apps", nil, &apps); err != nil {
+	apps, err := fetchStatusApps(ctx, c)
+	if err != nil {
 		fmt.Fprintf(stderr, "tinyship status: %v\n", err)
 		return 1
 	}
+	// Reconcile (report-only): the database's intent against the
+	// containers actually running. Docker being unavailable degrades
+	// the line to unknown instead of failing status itself.
+	rep, rerr := statusReconcile(ctx, apps)
 	warning := remoteListenWarning(health.TCPListen)
 	if *jsonOut {
-		out := map[string]any{"api": health, "apps": apps.Apps}
+		out := map[string]any{"api": health, "apps": apps}
+		if rerr != nil {
+			out["reconcile"] = map[string]string{"error": "docker unavailable"}
+		} else {
+			out["reconcile"] = rep
+		}
 		if warning != "" {
 			out["warnings"] = []string{warning}
 		}
@@ -722,8 +724,8 @@ func cmdStatus(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	if warning != "" {
 		fmt.Fprintf(stdout, "WARNING %s\n", warning)
 	}
-	fmt.Fprintf(stdout, "Apps    %d\n", len(apps.Apps))
-	for _, a := range apps.Apps {
+	fmt.Fprintf(stdout, "Apps    %d\n", len(apps))
+	for _, a := range apps {
 		ref := a.Image
 		if a.Tag != "" {
 			ref += ":" + a.Tag
@@ -734,7 +736,66 @@ func cmdStatus(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		}
 		fmt.Fprintf(stdout, "  %-20s %-30s desired=%s, %s\n", a.Name, ref, a.DesiredState, state)
 	}
+	if rerr != nil {
+		fmt.Fprintln(stdout, "Drift   unknown (docker unavailable)")
+	} else {
+		fmt.Fprintf(stdout, "Drift   %s\n", driftSummary(rep))
+	}
 	return 0
+}
+
+// statusApp is one app as the status view and the reconcile step both
+// read it: identity and intent for the comparison, display fields for
+// the listing.
+type statusApp struct {
+	ID                  string  `json:"id"`
+	Name                string  `json:"name"`
+	Image               string  `json:"image"`
+	Tag                 string  `json:"tag"`
+	DesiredState        string  `json:"desired_state"`
+	CurrentDeploymentID *string `json:"current_deployment_id"`
+}
+
+// fetchStatusApps is the shared /apps read behind status and doctor.
+func fetchStatusApps(ctx context.Context, c *apiClient) ([]statusApp, error) {
+	var view struct {
+		Apps []statusApp `json:"apps"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, "/apps", nil, &view); err != nil {
+		return nil, err
+	}
+	return view.Apps, nil
+}
+
+// statusReconcile compares the listed apps with the containers that
+// are actually running. Report-only: nothing is changed either way.
+func statusReconcile(ctx context.Context, apps []statusApp) (reconcile.Report, error) {
+	running, err := runningAppContainers(ctx)
+	if err != nil {
+		return reconcile.Report{}, err
+	}
+	rapps := make([]reconcile.App, len(apps))
+	for i, a := range apps {
+		rapps[i] = reconcile.App{ID: a.ID, Name: a.Name, DesiredState: a.DesiredState}
+	}
+	return reconcile.Compare(rapps, running), nil
+}
+
+// driftSummary compresses the report into the status line: "none",
+// or each category of real drift (a deliberately stopped app is not
+// drift; it is in the JSON report).
+func driftSummary(r reconcile.Report) string {
+	if !r.Drift() {
+		return "none"
+	}
+	var parts []string
+	if len(r.NeedDeploy) > 0 {
+		parts = append(parts, "needs a deploy: "+strings.Join(r.NeedDeploy, ", "))
+	}
+	if len(r.UnknownRunning) > 0 {
+		parts = append(parts, "running but unknown: "+strings.Join(r.UnknownRunning, ", "))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func shortID(id string) string {
