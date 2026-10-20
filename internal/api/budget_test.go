@@ -212,6 +212,59 @@ func TestSetBudgetZeroRestoresAuto(t *testing.T) {
 	}
 }
 
+func TestSetMinFreeDiskFloor(t *testing.T) {
+	srv, s := testServer(t, t.TempDir())
+	resp, err := http.Post(srv.URL+"/budget", "application/json",
+		strings.NewReader(`{"min_free_disk_mb":4096}`))
+	if err != nil {
+		t.Fatalf("set disk floor: %v", err)
+	}
+	body := decodeBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %v", resp.StatusCode, body)
+	}
+	if body["min_free_disk_mb"] != float64(4096) {
+		t.Errorf("min_free_disk_mb = %v, want 4096", body["min_free_disk_mb"])
+	}
+	if body["budget_source"] != "auto" {
+		t.Errorf("budget_source = %v, want auto (the RAM budget was not touched)", body["budget_source"])
+	}
+	settings, err := s.GetBudgetSettings(context.Background())
+	if err != nil {
+		t.Fatalf("settings: %v", err)
+	}
+	if settings.MinFreeDiskMB != 4096 {
+		t.Errorf("stored floor = %d, want 4096", settings.MinFreeDiskMB)
+	}
+	n, err := s.CountAuditEvents(context.Background(), "budget.set", "")
+	if err != nil {
+		t.Fatalf("count audit: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("budget.set audit events = %d, want 1", n)
+	}
+}
+
+func TestSetBudgetAndDiskFloorTogether(t *testing.T) {
+	srv, s := testServer(t, t.TempDir())
+	resp, err := http.Post(srv.URL+"/budget", "application/json",
+		strings.NewReader(`{"budget_mb":1536,"min_free_disk_mb":2560}`))
+	if err != nil {
+		t.Fatalf("set budget: %v", err)
+	}
+	body := decodeBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %v", resp.StatusCode, body)
+	}
+	settings, err := s.GetBudgetSettings(context.Background())
+	if err != nil {
+		t.Fatalf("settings: %v", err)
+	}
+	if settings.BudgetMB != 1536 || settings.MinFreeDiskMB != 2560 {
+		t.Errorf("settings = %+v, want 1536/2560", settings)
+	}
+}
+
 func TestSetBudgetValidatesInput(t *testing.T) {
 	srv, _ := testServer(t, t.TempDir())
 	for _, tc := range []struct {
@@ -219,8 +272,11 @@ func TestSetBudgetValidatesInput(t *testing.T) {
 		why  string
 	}{
 		{`{"budget_mb":-5}`, "negative budget"},
-		{`{}`, "missing budget_mb"},
+		{`{}`, "missing budget_mb and disk floor"},
 		{`{"budget":"lots"}`, "wrong type"},
+		{`{"min_free_disk_mb":0}`, "zero disk floor"},
+		{`{"min_free_disk_mb":255}`, "disk floor below the minimum"},
+		{`{"min_free_disk_mb":102401}`, "disk floor above the maximum"},
 	} {
 		resp, err := http.Post(srv.URL+"/budget", "application/json",
 			strings.NewReader(tc.body))

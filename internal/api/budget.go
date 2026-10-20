@@ -89,10 +89,13 @@ type setBudgetBody struct {
 	// BudgetMB overrides the auto budget; 0 restores the auto
 	// derivation from MemTotal.
 	BudgetMB *int `json:"budget_mb"`
+	// MinFreeDiskMB is the free-disk floor below which admission
+	// refuses a deploy before pulling.
+	MinFreeDiskMB *int `json:"min_free_disk_mb"`
 }
 
 // handleSetBudget serves POST /budget: the operator's explicit override
-// of the host RAM budget. It records an audit row because this changes
+// of the host guardrails. It records an audit row because this changes
 // what the admission guard will allow.
 func (s *server) handleSetBudget(w http.ResponseWriter, r *http.Request) {
 	var body setBudgetBody
@@ -100,16 +103,41 @@ func (s *server) handleSetBudget(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "E_VALIDATION", err.Error())
 		return
 	}
-	if body.BudgetMB == nil {
-		writeError(w, http.StatusBadRequest, "E_VALIDATION", "budget_mb is required")
+	if body.BudgetMB == nil && body.MinFreeDiskMB == nil {
+		writeError(w, http.StatusBadRequest, "E_VALIDATION",
+			"budget_mb or min_free_disk_mb is required")
 		return
 	}
-	if err := s.store.SetBudgetMB(r.Context(), *body.BudgetMB); err != nil {
-		writeError(w, http.StatusBadRequest, "E_VALIDATION", err.Error())
+	if body.BudgetMB != nil && *body.BudgetMB < 0 {
+		writeError(w, http.StatusBadRequest, "E_VALIDATION",
+			"budget_mb must be non-negative")
 		return
+	}
+	if body.MinFreeDiskMB != nil &&
+		(*body.MinFreeDiskMB < store.MinFreeDiskMBFloor ||
+			*body.MinFreeDiskMB > store.MaxFreeDiskMB) {
+		writeError(w, http.StatusBadRequest, "E_VALIDATION", fmt.Sprintf(
+			"min_free_disk_mb must be between %d and %d",
+			store.MinFreeDiskMBFloor, store.MaxFreeDiskMB))
+		return
+	}
+	detail := map[string]any{}
+	if body.BudgetMB != nil {
+		if err := s.store.SetBudgetMB(r.Context(), *body.BudgetMB); err != nil {
+			writeError(w, http.StatusBadRequest, "E_VALIDATION", err.Error())
+			return
+		}
+		detail["budget_mb"] = *body.BudgetMB
+	}
+	if body.MinFreeDiskMB != nil {
+		if err := s.store.SetMinFreeDiskMB(r.Context(), *body.MinFreeDiskMB); err != nil {
+			writeError(w, http.StatusBadRequest, "E_VALIDATION", err.Error())
+			return
+		}
+		detail["min_free_disk_mb"] = *body.MinFreeDiskMB
 	}
 	if err := s.store.AppendAudit(r.Context(), actorName(r), "budget.set", "host", "",
-		"ok", map[string]any{"budget_mb": *body.BudgetMB}); err != nil {
+		"ok", detail); err != nil {
 		s.logger.Error("audit budget.set", "err", err)
 	}
 	view, err := buildBudgetView(r.Context(), s.store)

@@ -62,6 +62,20 @@ func TestBudgetSettingsOverrideAndValidate(t *testing.T) {
 	if err := s.SetBudgetMB(ctx, -1); err == nil {
 		t.Error("negative budget accepted; want rejection")
 	}
+
+	// The disk floor is bounded: zero would silently disable the
+	// admission guard, and absurd values would make every deploy fail.
+	for _, bad := range []int{0, MinFreeDiskMBFloor - 1, MaxFreeDiskMB + 1} {
+		if err := s.SetMinFreeDiskMB(ctx, bad); err == nil {
+			t.Errorf("SetMinFreeDiskMB(%d) accepted; want rejection", bad)
+		}
+	}
+	if err := s.SetMinFreeDiskMB(ctx, MinFreeDiskMBFloor); err != nil {
+		t.Errorf("SetMinFreeDiskMB(%d): %v", MinFreeDiskMBFloor, err)
+	}
+	if err := s.SetMinFreeDiskMB(ctx, MaxFreeDiskMB); err != nil {
+		t.Errorf("SetMinFreeDiskMB(%d): %v", MaxFreeDiskMB, err)
+	}
 }
 
 func TestBudgetSettingsRejectGarbage(t *testing.T) {

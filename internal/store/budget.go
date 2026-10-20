@@ -24,6 +24,11 @@ const (
 const (
 	DefaultMinFreeDiskMB = 3072
 	DefaultCPUOvercommit = 2.0
+	// MinFreeDiskMBFloor and MaxFreeDiskMB bound the operator-set floor.
+	// Zero is rejected: the admission guard must not be silently
+	// disabled, and force never bypasses it.
+	MinFreeDiskMBFloor = 256
+	MaxFreeDiskMB      = 102400
 )
 
 // BudgetSettings is the host-level guardrail configuration.
@@ -91,10 +96,13 @@ func (s *Store) SetBudgetMB(ctx context.Context, mb int) error {
 	return s.PutSetting(ctx, BudgetMBKey, strconv.Itoa(mb))
 }
 
-// SetMinFreeDiskMB overrides the free-disk floor.
+// SetMinFreeDiskMB overrides the free-disk floor. The floor is bounded
+// rather than allowing zero, so an operator cannot disable the guard
+// while believing deploys are still protected.
 func (s *Store) SetMinFreeDiskMB(ctx context.Context, mb int) error {
-	if mb < 0 {
-		return errors.New("store: min free disk must be non-negative")
+	if mb < MinFreeDiskMBFloor || mb > MaxFreeDiskMB {
+		return fmt.Errorf("store: min free disk must be between %d and %d MiB",
+			MinFreeDiskMBFloor, MaxFreeDiskMB)
 	}
 	return s.PutSetting(ctx, MinFreeDiskMBKey, strconv.Itoa(mb))
 }
