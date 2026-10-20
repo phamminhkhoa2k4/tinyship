@@ -279,7 +279,9 @@ EOF
 # write_caddy_unit installs the systemd drop-in that points Caddy at
 # the TinyShip baseline. The service group makes the admin socket group
 # caddy-admin, which tinyship-worker joins; RuntimeDirectory creates
-# /run/caddy. An existing file is never overwritten.
+# /run/caddy. The OOM score keeps the proxy below app containers when
+# the kernel has to choose a victim. An existing file is never
+# overwritten.
 write_caddy_unit() {
     local caddy_bin dropin
     caddy_bin=$(resolve_caddy)
@@ -298,6 +300,7 @@ write_caddy_unit() {
 Group=caddy-admin
 RuntimeDirectory=caddy
 RuntimeDirectoryMode=0755
+OOMScoreAdjust=-500
 ExecStart=
 ExecStart=$caddy_bin run --config /etc/caddy/caddy.json
 EOF
