@@ -42,6 +42,9 @@ type LogServer struct {
 	// Stats is shared with the worker loop; nil makes /stats unavailable
 	// (tests that do not exercise stats).
 	Stats *StatsSampler
+	// GC applies the image retention policy for on-demand runs; nil
+	// makes /gc unavailable.
+	GC *GCRunner
 
 	server *http.Server
 	ln     net.Listener
@@ -115,6 +118,7 @@ func (l *LogServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /logs", l.handleLogs)
 	mux.HandleFunc("GET /stats", l.handleStats)
+	mux.HandleFunc("POST /gc", l.handleGC)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ok\n")
@@ -218,6 +222,38 @@ func (l *LogServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"apps": apps})
+}
+
+// handleGC runs the image collector on demand. The request body is a
+// strict object: an unknown field or a non-boolean dry_run is rejected
+// before any image is touched.
+func (l *LogServer) handleGC(w http.ResponseWriter, r *http.Request) {
+	if l.GC == nil {
+		writeLogError(w, http.StatusServiceUnavailable, "E_GC_UNAVAILABLE",
+			"the image collector is not running")
+		return
+	}
+	var body struct {
+		App    string `json:"app"`
+		DryRun bool   `json:"dry_run"`
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeLogError(w, http.StatusBadRequest, "E_VALIDATION", err.Error())
+		return
+	}
+	res, err := l.GC.Run(r.Context(), GCOptions{App: body.App, DryRun: body.DryRun})
+	switch {
+	case errors.Is(err, ErrGCAppNotFound):
+		writeLogError(w, http.StatusNotFound, "E_NOT_FOUND", err.Error())
+		return
+	case err != nil:
+		writeLogError(w, http.StatusBadGateway, "E_GC_FAILED", err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(res)
 }
 
 func writeLogError(w http.ResponseWriter, status int, code, message string) {

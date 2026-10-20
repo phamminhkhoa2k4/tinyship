@@ -37,6 +37,7 @@ func startLogServer(t *testing.T, f *deployFixture) (*http.Client, string, func(
 		t.Fatalf("NewLogServer: %v", err)
 	}
 	ls.Stats = NewStatsSampler(f.s, f.fk, slog.New(slog.DiscardHandler))
+	ls.GC = NewGCRunner(f.s, f.fk, "test-worker", slog.New(slog.DiscardHandler))
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -224,6 +225,54 @@ func TestLogServerStatsEndpoint(t *testing.T) {
 	}
 	if payload.Apps[0].MemUsageMB != 8 || payload.Apps[0].NearLimit {
 		t.Errorf("stats = %+v, want 8 MiB and not near the limit", payload.Apps[0])
+	}
+}
+
+func TestLogServerGCEndpoint(t *testing.T) {
+	f := newDeployFixture(t, happyConfig)
+	if err := f.run(1, 5); err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	client, _, cleanup := startLogServer(t, f)
+	defer cleanup()
+
+	post := func(body string) *http.Response {
+		t.Helper()
+		resp, err := client.Post("http://unix/gc", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST /gc: %v", err)
+		}
+		return resp
+	}
+
+	// Unknown fields are rejected before the collector runs.
+	resp := post(`{"sudo":true}`)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("unknown field: status = %d, want 400", resp.StatusCode)
+	}
+
+	// Unknown app names are a lookup failure, not an empty success.
+	resp = post(`{"app":"ghost"}`)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("unknown app: status = %d, want 404", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// A dry run reports without removing; this deployment is inside the
+	// default retention window, so there is nothing to list.
+	resp = post(`{"dry_run":true}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("dry run: status = %d, body = %s", resp.StatusCode, body)
+	}
+	var res GCResult
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !res.DryRun || len(res.Removed) != 0 {
+		t.Errorf("dry run result = %+v, want dry_run with no candidates", res)
 	}
 }
 

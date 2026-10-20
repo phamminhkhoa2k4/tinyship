@@ -61,6 +61,7 @@ type Config struct {
 	ClaimInterval time.Duration // idle poll period; default 1s
 	ReapInterval  time.Duration // default store.ReapEvery
 	StatsInterval time.Duration // resource sampling period; default StatsInterval
+	GCInterval    time.Duration // image collection period; default DefaultGCInterval
 	Lease         time.Duration // claim lease duration; default store.LeaseDuration
 	BackoffBase   time.Duration // retry backoff base; default store.BackoffBase
 	Handlers      map[string]Handler
@@ -175,6 +176,9 @@ func RunStore(ctx context.Context, s *store.Store, cfg Config) error {
 	if cfg.StatsInterval <= 0 {
 		cfg.StatsInterval = StatsInterval
 	}
+	if cfg.GCInterval <= 0 {
+		cfg.GCInterval = DefaultGCInterval
+	}
 	if cfg.Lease <= 0 {
 		cfg.Lease = store.LeaseDuration
 	}
@@ -217,6 +221,19 @@ func RunStore(ctx context.Context, s *store.Store, cfg Config) error {
 			logger.Warn("worker: initial stats sample failed", "err", err)
 		}
 	}
+	// Image collection also needs the daemon. It runs once at startup so
+	// a long-lived worker does not wait a full interval after a restart.
+	var collector *GCRunner
+	if cfg.Docker != nil {
+		collector = NewGCRunner(s, cfg.Docker, cfg.WorkerID, logger)
+		if res, err := collector.Run(ctx, GCOptions{}); err != nil {
+			logger.Warn("worker: initial image collection failed", "err", err)
+		} else if len(res.Removed) > 0 || len(res.Skipped) > 0 {
+			logger.Info("worker: image collection",
+				"removed", len(res.Removed), "freed_bytes", res.FreedBytes,
+				"skipped", len(res.Skipped))
+		}
+	}
 
 	// The read-only log socket: the API reaches container logs only
 	// through here, and only after the ownership checks.
@@ -229,6 +246,7 @@ func RunStore(ctx context.Context, s *store.Store, cfg Config) error {
 			return fmt.Errorf("worker: log server: %w", err)
 		}
 		ls.Stats = sampler
+		ls.GC = collector
 		var wg sync.WaitGroup
 		wg.Add(1)
 		go func() {
@@ -253,6 +271,12 @@ func RunStore(ctx context.Context, s *store.Store, cfg Config) error {
 		defer tick.Stop()
 		stats = tick.C
 	}
+	var collect <-chan time.Time
+	if collector != nil {
+		tick := time.NewTicker(cfg.GCInterval)
+		defer tick.Stop()
+		collect = tick.C
+	}
 
 	for {
 		select {
@@ -263,6 +287,15 @@ func RunStore(ctx context.Context, s *store.Store, cfg Config) error {
 				// A missed sample only delays the next observation.
 				logger.Warn("worker: stats sample failed", "err", err)
 			}
+		case <-collect:
+			res, err := collector.Run(ctx, GCOptions{})
+			if err != nil {
+				logger.Warn("worker: image collection failed", "err", err)
+				continue
+			}
+			logger.Info("worker: image collection",
+				"removed", len(res.Removed), "freed_bytes", res.FreedBytes,
+				"skipped", len(res.Skipped))
 		case <-reap.C:
 			requeued, failed, err := s.ReapExpired(ctx, time.Now().UTC())
 			if err != nil {

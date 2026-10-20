@@ -29,6 +29,7 @@ import (
 type fakeContainer struct {
 	id     string
 	name   string
+	image  string
 	labels map[string]string
 	state  string
 	exit   int
@@ -148,7 +149,8 @@ func (f *fakeDocker) CreateContainer(_ context.Context, spec *policy.ContainerSp
 	for k, v := range spec.Labels {
 		labels[k] = v
 	}
-	f.containers[id] = &fakeContainer{id: id, name: spec.Name, state: "created", labels: labels}
+	f.containers[id] = &fakeContainer{id: id, name: spec.Name, image: spec.Image,
+		state: "created", labels: labels}
 	f.byName[spec.Name] = id
 	f.creates++
 	return id, nil
@@ -214,8 +216,8 @@ func (f *fakeDocker) InspectContainer(_ context.Context, id string) (*docker.Con
 	for k, v := range c.labels {
 		labels[k] = v
 	}
-	return &docker.ContainerInfo{ID: c.id, Name: c.name, State: c.state, ExitCode: c.exit,
-		OOMKilled: c.oom, Labels: labels}, nil
+	return &docker.ContainerInfo{ID: c.id, Name: c.name, Image: c.image,
+		State: c.state, ExitCode: c.exit, OOMKilled: c.oom, Labels: labels}, nil
 }
 
 func (f *fakeDocker) Stats(context.Context, string) (*docker.ContainerStats, error) {
@@ -238,7 +240,11 @@ func (f *fakeDocker) InspectImage(_ context.Context, ref string) (string, int64,
 	if !ok {
 		return "", 0, fmt.Errorf("Error response from daemon: No such image: %s", ref)
 	}
-	return "", size, nil
+	digest := ""
+	if _, d, found := strings.Cut(ref, "@"); found {
+		digest = d
+	}
+	return digest, size, nil
 }
 
 func (f *fakeDocker) RemoveImage(_ context.Context, ref string) error {
@@ -278,7 +284,8 @@ func (f *fakeDocker) ListManagedContainers(context.Context) ([]docker.ContainerI
 			labels[k] = v
 		}
 		out = append(out, docker.ContainerInfo{
-			ID: c.id, Name: c.name, State: c.state, ExitCode: c.exit, Labels: labels,
+			ID: c.id, Name: c.name, Image: c.image, State: c.state,
+			ExitCode: c.exit, Labels: labels,
 		})
 	}
 	return out, nil
