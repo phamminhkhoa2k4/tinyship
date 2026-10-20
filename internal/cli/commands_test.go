@@ -723,6 +723,39 @@ func TestBudgetSetMBPostsOverride(t *testing.T) {
 	}
 }
 
+func TestBudgetSetMBZeroIsSentExplicitly(t *testing.T) {
+	var got map[string]any
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/budget":
+			json.NewDecoder(r.Body).Decode(&got)
+			writeJSON(w, http.StatusOK, map[string]any{
+				"budget_mb": 1934, "budget_source": "auto", "mem_total_mb": 3868,
+				"committed_mb": 0, "free_mb": 1934, "apps": []map[string]any{},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/budget":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"budget_mb": 1934, "budget_source": "auto", "mem_total_mb": 3868,
+				"committed_mb": 0, "free_mb": 1934, "apps": []map[string]any{},
+			})
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			writeErr(w, http.StatusNotFound, "E_NOT_FOUND", "x")
+		}
+	}))
+
+	code, stdout, stderr := run(t, "budget", "--set-mb", "0")
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q, stdout = %q", code, stderr, stdout)
+	}
+	if got == nil || got["budget_mb"] != float64(0) {
+		t.Errorf("posted body = %v, want an explicit budget_mb 0", got)
+	}
+	if !strings.Contains(stdout, "Budget set to auto") {
+		t.Errorf("stdout missing the auto confirmation:\n%s", stdout)
+	}
+}
+
 func TestBudgetSetMinFreeDiskPostsOverride(t *testing.T) {
 	stubDiskFree(t, 8192, nil)
 	var got map[string]any
