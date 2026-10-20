@@ -314,7 +314,10 @@ type ContainerInfo struct {
 	// ExitCode is meaningful when State is "exited"; it makes start/health
 	// failure messages concrete.
 	ExitCode int
-	Labels   map[string]string
+	// OOMKilled reports whether the kernel killed the container's last
+	// run for exceeding its memory limit. Only inspect fills it.
+	OOMKilled bool
+	Labels    map[string]string
 }
 
 // InspectContainer returns the state and labels of a container (the
@@ -333,11 +336,50 @@ func (w *Wrapper) InspectContainer(ctx context.Context, id string) (*ContainerIn
 	if inspected.State != nil {
 		info.State = inspected.State.Status
 		info.ExitCode = inspected.State.ExitCode
+		info.OOMKilled = inspected.State.OOMKilled
 		if inspected.State.Health != nil {
 			info.Health = inspected.State.Health.Status
 		}
 	}
 	return info, nil
+}
+
+// ContainerStats is one live resource sample of a running container.
+type ContainerStats struct {
+	MemUsageBytes uint64
+	MemLimitBytes uint64
+	// CPUPercent is relative to one core: 100 means one fully busy CPU.
+	CPUPercent float64
+}
+
+// Stats reads one non-streaming sample. The daemon reports the previous
+// sample alongside it, which gives the CPU percentage a baseline; when
+// the baseline is absent the result is 0 rather than a fabricated number.
+func (w *Wrapper) Stats(ctx context.Context, id string) (*ContainerStats, error) {
+	resp, err := w.cli.ContainerStats(ctx, id, false)
+	if err != nil {
+		return nil, fmt.Errorf("docker: stats %s: %w", id, err)
+	}
+	defer resp.Body.Close()
+
+	var raw container.StatsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, fmt.Errorf("docker: decode stats %s: %w", id, err)
+	}
+	out := &ContainerStats{
+		MemUsageBytes: raw.MemoryStats.Usage,
+		MemLimitBytes: raw.MemoryStats.Limit,
+	}
+	cpuDelta := float64(raw.CPUStats.CPUUsage.TotalUsage) - float64(raw.PreCPUStats.CPUUsage.TotalUsage)
+	sysDelta := float64(raw.CPUStats.SystemUsage) - float64(raw.PreCPUStats.SystemUsage)
+	cpus := float64(raw.CPUStats.OnlineCPUs)
+	if cpus == 0 {
+		cpus = float64(len(raw.CPUStats.CPUUsage.PercpuUsage))
+	}
+	if cpuDelta > 0 && sysDelta > 0 && cpus > 0 {
+		out.CPUPercent = cpuDelta / sysDelta * cpus * 100
+	}
+	return out, nil
 }
 
 // ContainerLogs returns the tail of a container's log as plain text
@@ -498,6 +540,7 @@ var _ interface {
 	StopContainer(context.Context, string, time.Duration) error
 	RemoveContainer(context.Context, string, bool) error
 	InspectContainer(context.Context, string) (*ContainerInfo, error)
+	Stats(context.Context, string) (*ContainerStats, error)
 	ContainerLogs(context.Context, string, int, time.Duration, bool) (io.ReadCloser, error)
 	ExecProbe(context.Context, string, []string, time.Duration) (int, error)
 	ListManagedContainers(context.Context) ([]ContainerInfo, error)

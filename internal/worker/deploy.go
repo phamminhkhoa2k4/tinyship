@@ -46,6 +46,11 @@ type Docker interface {
 	// managed label; app teardown finds its containers by app label
 	// even when database rows are already gone.
 	ListManagedContainers(ctx context.Context) ([]docker.ContainerInfo, error)
+	// Stats samples one running container's memory and CPU.
+	Stats(ctx context.Context, id string) (*docker.ContainerStats, error)
+	// InspectImage and RemoveImage serve the retention collector.
+	InspectImage(ctx context.Context, ref string) (digest string, size int64, err error)
+	RemoveImage(ctx context.Context, ref string) error
 }
 
 // Deployer runs the deploy pipeline for claimed deploy jobs.

@@ -32,6 +32,7 @@ type fakeContainer struct {
 	labels map[string]string
 	state  string
 	exit   int
+	oom    bool
 }
 
 type fakeDocker struct {
@@ -58,6 +59,14 @@ type fakeDocker struct {
 	logSince  time.Duration
 	logFollow bool
 
+	statMemBytes uint64
+	statMemLimit uint64
+	statCPUPct   float64
+	statErr      error
+
+	images    map[string]int64 // image ref -> size in bytes
+	removedIm []string
+
 	pullErr    error
 	digest     string
 	createErr  error
@@ -75,6 +84,7 @@ func newFakeDocker() *fakeDocker {
 		byName:     map[string]string{},
 		digest:     "sha256:" + strings.Repeat("ab", 32),
 		logs:       "boot line\nready to serve\n",
+		images:     map[string]int64{},
 	}
 }
 
@@ -204,7 +214,42 @@ func (f *fakeDocker) InspectContainer(_ context.Context, id string) (*docker.Con
 	for k, v := range c.labels {
 		labels[k] = v
 	}
-	return &docker.ContainerInfo{ID: c.id, Name: c.name, State: c.state, ExitCode: c.exit, Labels: labels}, nil
+	return &docker.ContainerInfo{ID: c.id, Name: c.name, State: c.state, ExitCode: c.exit,
+		OOMKilled: c.oom, Labels: labels}, nil
+}
+
+func (f *fakeDocker) Stats(context.Context, string) (*docker.ContainerStats, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.statErr != nil {
+		return nil, f.statErr
+	}
+	return &docker.ContainerStats{
+		MemUsageBytes: f.statMemBytes,
+		MemLimitBytes: f.statMemLimit,
+		CPUPercent:    f.statCPUPct,
+	}, nil
+}
+
+func (f *fakeDocker) InspectImage(_ context.Context, ref string) (string, int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	size, ok := f.images[ref]
+	if !ok {
+		return "", 0, fmt.Errorf("Error response from daemon: No such image: %s", ref)
+	}
+	return "", size, nil
+}
+
+func (f *fakeDocker) RemoveImage(_ context.Context, ref string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.images[ref]; !ok {
+		return fmt.Errorf("Error response from daemon: No such image: %s", ref)
+	}
+	delete(f.images, ref)
+	f.removedIm = append(f.removedIm, ref)
+	return nil
 }
 
 func (f *fakeDocker) ContainerLogs(_ context.Context, _ string, tail int, since time.Duration, follow bool) (io.ReadCloser, error) {
@@ -512,6 +557,15 @@ func (s *specCapture) RemoveContainer(ctx context.Context, id string, force bool
 }
 func (s *specCapture) InspectContainer(ctx context.Context, id string) (*docker.ContainerInfo, error) {
 	return s.inner.InspectContainer(ctx, id)
+}
+func (s *specCapture) Stats(ctx context.Context, id string) (*docker.ContainerStats, error) {
+	return s.inner.Stats(ctx, id)
+}
+func (s *specCapture) InspectImage(ctx context.Context, ref string) (string, int64, error) {
+	return s.inner.InspectImage(ctx, ref)
+}
+func (s *specCapture) RemoveImage(ctx context.Context, ref string) error {
+	return s.inner.RemoveImage(ctx, ref)
 }
 func (s *specCapture) ContainerLogs(ctx context.Context, id string, tail int, since time.Duration, follow bool) (io.ReadCloser, error) {
 	return s.inner.ContainerLogs(ctx, id, tail, since, follow)
