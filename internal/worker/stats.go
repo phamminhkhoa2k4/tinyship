@@ -98,8 +98,9 @@ func (s *StatsSampler) Sample(ctx context.Context) ([]AppStats, error) {
 	}
 
 	now := time.Now().UTC()
-	out := make([]AppStats, 0, len(apps))
-	for _, app := range apps {
+	out := make([]AppStats, len(apps))
+	var wg sync.WaitGroup
+	for i, app := range apps {
 		st := AppStats{
 			AppID: app.ID, Name: app.Name, State: "missing", SampledAt: now,
 			MemLimitMB: appMemLimitMB(app.ConfigJSON),
@@ -109,9 +110,22 @@ func (s *StatsSampler) Sample(ctx context.Context) ([]AppStats, error) {
 			st.OOMKillCount = prev.OOMKillCount
 			st.MemUsageMB = prev.MemUsageMB
 		}
+		out[i] = st
 		if info, ok := byApp[app.ID]; ok {
-			s.fillContainer(ctx, &st, prev, info)
+			// The daemon's one-shot read waits for a sampling window, so
+			// collect containers concurrently; each goroutine owns one
+			// slice element and no store write happens until they join.
+			wg.Add(1)
+			go func(i int, prev *store.ContainerState, info docker.ContainerInfo) {
+				defer wg.Done()
+				s.fillContainer(ctx, &out[i], prev, info)
+			}(i, prev, info)
 		}
+	}
+	wg.Wait()
+
+	for i, app := range apps {
+		st := &out[i]
 		if st.MemLimitMB > 0 {
 			st.NearLimit = st.MemUsageMB*100 >= st.MemLimitMB*NearLimitPercent
 		}
@@ -126,7 +140,6 @@ func (s *StatsSampler) Sample(ctx context.Context) ([]AppStats, error) {
 		}); err != nil {
 			s.Logger.Warn("worker: cannot store container stats", "app", app.Name, "err", err)
 		}
-		out = append(out, st)
 	}
 	return out, nil
 }

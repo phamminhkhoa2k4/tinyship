@@ -3,9 +3,11 @@ package worker
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/tinyship/tinyship/internal/docker"
+	"github.com/tinyship/tinyship/internal/policy"
 	"github.com/tinyship/tinyship/internal/store"
 )
 
@@ -135,6 +137,42 @@ func TestOOMCountAccumulatesAcrossContainers(t *testing.T) {
 	for _, tc := range cases {
 		if got := s.oomCount(ctx, tc.prev, tc.current); got != tc.want {
 			t.Errorf("%s: count = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestStatsSamplerCoversEveryApp(t *testing.T) {
+	f := newDeployFixture(t, happyConfig)
+	if err := f.run(1, 5); err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	cfg2 := strings.Replace(happyConfig, `"name": "web"`, `"name": "api2"`, 1)
+	app2, err := f.s.CreateApp(context.Background(), store.CreateAppInput{
+		Name: "api2", ConfigJSON: cfg2, Actor: "cli",
+	})
+	if err != nil {
+		t.Fatalf("create second app: %v", err)
+	}
+	f.fk.addContainer("second-container", "ts-api2", "running", map[string]string{
+		policy.LabelManaged: policy.ManagedValue,
+		policy.LabelApp:     app2.ID,
+	})
+	f.fk.mu.Lock()
+	f.fk.statMemBytes = 16 << 20
+	f.fk.statMemLimit = 64 << 20
+	f.fk.mu.Unlock()
+
+	sampler := NewStatsSampler(f.s, f.fk, slog.New(slog.DiscardHandler))
+	apps, err := sampler.Sample(f.ctx)
+	if err != nil {
+		t.Fatalf("sample: %v", err)
+	}
+	if len(apps) != 2 {
+		t.Fatalf("apps = %d, want both apps", len(apps))
+	}
+	for _, app := range apps {
+		if app.State != "running" || app.MemUsageMB != 16 {
+			t.Errorf("app %q = %+v, want running with 16 MiB", app.Name, app)
 		}
 	}
 }

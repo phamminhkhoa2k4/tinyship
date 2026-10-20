@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tinyship/tinyship/internal/caddy"
@@ -278,14 +279,23 @@ func RunStore(ctx context.Context, s *store.Store, cfg Config) error {
 		collect = tick.C
 	}
 
+	// A one-shot daemon read waits for a sampling window, so run periodic
+	// samples off the job loop; a deploy claim must not queue behind stats.
+	var statsBusy atomic.Bool
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-stats:
-			if _, err := sampler.Sample(ctx); err != nil {
-				// A missed sample only delays the next observation.
-				logger.Warn("worker: stats sample failed", "err", err)
+			if statsBusy.CompareAndSwap(false, true) {
+				go func() {
+					defer statsBusy.Store(false)
+					if _, err := sampler.Sample(ctx); err != nil {
+						// A missed sample only delays the next observation.
+						logger.Warn("worker: stats sample failed", "err", err)
+					}
+				}()
 			}
 		case <-collect:
 			res, err := collector.Run(ctx, GCOptions{})
