@@ -376,6 +376,8 @@ type fakeWorker struct {
 	status    int
 	body      string
 	statsBody string
+	gcBody    string
+	gcRaw     string
 	requests  int
 }
 
@@ -409,6 +411,22 @@ func (f *fakeWorker) start(t *testing.T, runDir string) {
 		body := f.statsBody
 		if body == "" {
 			body = `{"apps":[]}`
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+	})
+	mux.HandleFunc("POST /gc", func(w http.ResponseWriter, r *http.Request) {
+		f.requests++
+		raw, _ := io.ReadAll(r.Body)
+		f.gcRaw = string(raw)
+		status := f.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		body := f.gcBody
+		if body == "" {
+			body = `{"dry_run":false,"removed":[],"freed_bytes":0}`
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -545,6 +563,42 @@ func TestLogsProxyWithoutWorkerIs503(t *testing.T) {
 	}
 	if code := errCode(t, resp); code != "E_WORKER_UNAVAILABLE" {
 		t.Errorf("code = %q, want E_WORKER_UNAVAILABLE", code)
+	}
+}
+
+func TestGCProxyForwardsValidatedBody(t *testing.T) {
+	runDir := t.TempDir()
+	fw := &fakeWorker{gcBody: `{"dry_run":true,"removed":[],"freed_bytes":0}`}
+	fw.start(t, runDir)
+	srv, _ := testServer(t, runDir)
+
+	resp, err := http.Post(srv.URL+"/gc", "application/json",
+		strings.NewReader(`{"app":"web","dry_run":true}`))
+	if err != nil {
+		t.Fatalf("POST gc: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(fw.gcRaw, `"app":"web"`) || !strings.Contains(fw.gcRaw, `"dry_run":true`) {
+		t.Errorf("worker saw %q", fw.gcRaw)
+	}
+
+	// Unknown fields never reach the worker.
+	before := fw.requests
+	resp2, err := http.Post(srv.URL+"/gc", "application/json",
+		strings.NewReader(`{"sudo":true}`))
+	if err != nil {
+		t.Fatalf("POST gc bad body: %v", err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusBadRequest {
+		t.Errorf("unknown field status = %d, want 400", resp2.StatusCode)
+	}
+	if fw.requests != before {
+		t.Error("invalid gc request was forwarded to the worker")
 	}
 }
 

@@ -1062,3 +1062,77 @@ func TestStatsRendersAndFilters(t *testing.T) {
 		t.Errorf("json apps = %+v", view.Apps)
 	}
 }
+
+// --- gc ----------------------------------------------------------------------------
+
+func TestGCDryRunSendsOptionsAndRenders(t *testing.T) {
+	var got map[string]any
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/gc" {
+			t.Errorf("request = %s %s, want POST /gc", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"dry_run": true,
+			"removed": []map[string]any{{
+				"app": "web", "ref": "traefik/whoami@sha256:abc",
+				"digest": "sha256:abc", "size_bytes": 2 << 20,
+			}},
+			"freed_bytes": 2 << 20,
+			"skipped": []map[string]any{{
+				"app": "api", "reason": "deployment in flight",
+			}},
+		})
+	}))
+
+	code, stdout, stderr := run(t, "gc", "--app", "web", "--dry-run")
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q", code, stderr)
+	}
+	if got["app"] != "web" || got["dry_run"] != true {
+		t.Errorf("request body = %v, want app=web dry_run=true", got)
+	}
+	for _, want := range []string{"Would remove", "web", "2.0 MiB", "Skipped api", "deployment in flight"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("output missing %q:\n%s", want, stdout)
+		}
+	}
+}
+
+func TestGCRemovesAndReportsFreeing(t *testing.T) {
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&map[string]any{}); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"dry_run": false,
+			"removed": []map[string]any{{
+				"app": "web", "ref": "traefik/whoami@sha256:abc",
+				"digest": "sha256:abc", "size_bytes": 3 << 30,
+			}},
+			"freed_bytes": 3 << 30,
+		})
+	}))
+
+	code, stdout, stderr := run(t, "gc")
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q", code, stderr)
+	}
+	for _, want := range []string{"Removed 1 image(s)", "3.0 GiB", "freed 3.0 GiB"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("output missing %q:\n%s", want, stdout)
+		}
+	}
+}
+
+func TestGCUnknownAppFails(t *testing.T) {
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeErr(w, http.StatusNotFound, "E_NOT_FOUND", `no such app: "ghost"`)
+	}))
+	code, _, stderr := run(t, "gc", "--app", "ghost")
+	if code != 1 || !strings.Contains(stderr, "E_NOT_FOUND") {
+		t.Errorf("exit = %d, stderr = %q", code, stderr)
+	}
+}

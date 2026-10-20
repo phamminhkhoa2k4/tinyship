@@ -7,6 +7,7 @@
 //
 //	GET /healthz
 //	GET /stats live app resource view via the worker
+//	POST /gc remove images outside the retention window via the worker
 //	POST /apps create an app from a strict config object
 //	GET /apps list apps
 //	GET /apps/{name} show app + current deployment
@@ -32,6 +33,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -269,6 +271,7 @@ func newMuxWith(s *store.Store, runDir string, logger *slog.Logger, resolve Reso
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
 	mux.HandleFunc("GET /stats", srv.handleStats)
+	mux.HandleFunc("POST /gc", srv.handleGC)
 	mux.HandleFunc("GET /budget", srv.handleBudget)
 	mux.HandleFunc("POST /budget", srv.handleSetBudget)
 	mux.HandleFunc("POST /apps", srv.handleCreateApp)
@@ -633,6 +636,29 @@ func (s *server) handleShowDeployment(w http.ResponseWriter, r *http.Request) {
 // access, so the sample is taken by the worker and copied through.
 func (s *server) handleStats(w http.ResponseWriter, r *http.Request) {
 	s.proxyWorker(w, r, http.MethodGet, "http://worker/stats", nil)
+}
+
+// handleGC validates the request shape and forwards it to the worker,
+// which owns the retention policy and the Docker calls.
+func (s *server) handleGC(w http.ResponseWriter, r *http.Request) {
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4096))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "E_VALIDATION", err.Error())
+		return
+	}
+	var body struct {
+		App    string `json:"app"`
+		DryRun bool   `json:"dry_run"`
+	}
+	if len(raw) > 0 {
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "E_VALIDATION", err.Error())
+			return
+		}
+	}
+	s.proxyWorker(w, r, http.MethodPost, "http://worker/gc", bytes.NewReader(raw))
 }
 
 // proxyWorker forwards one request to the worker socket and copies the
