@@ -999,3 +999,66 @@ func TestRemoteListenWarningTable(t *testing.T) {
 		}
 	}
 }
+
+// --- stats -------------------------------------------------------------------------
+
+func TestStatsRendersAndFilters(t *testing.T) {
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/stats" {
+			t.Errorf("request = %s %s, want GET /stats", r.Method, r.URL.Path)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"apps": []map[string]any{
+				{
+					"app_id": "a1", "name": "web", "state": "running",
+					"mem_usage_mb": 60, "mem_limit_mb": 64, "cpu_percent": 12.5,
+					"near_limit": true, "oom_kill_count": 2,
+					"sampled_at": "2026-10-21T00:00:00Z",
+				},
+				{
+					"app_id": "a2", "name": "api", "state": "missing",
+					"mem_usage_mb": 0, "mem_limit_mb": 0, "cpu_percent": 0,
+					"near_limit": false, "oom_kill_count": 0,
+					"sampled_at": "2026-10-21T00:00:00Z",
+				},
+			},
+		})
+	}))
+
+	code, stdout, stderr := run(t, "stats")
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q", code, stderr)
+	}
+	for _, want := range []string{"NAME", "web", "60/64 MiB", "yes", "2", "api"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("output missing %q:\n%s", want, stdout)
+		}
+	}
+
+	// One app filters the table.
+	code, stdout, _ = run(t, "stats", "web")
+	if code != 0 || strings.Contains(stdout, "api") || !strings.Contains(stdout, "web") {
+		t.Errorf("filtered stats: exit=%d\n%s", code, stdout)
+	}
+
+	// Unknown app fails instead of printing an empty table.
+	code, _, stderr = run(t, "stats", "ghost")
+	if code != 1 || !strings.Contains(stderr, "no such app") {
+		t.Errorf("unknown app: exit=%d stderr=%q", code, stderr)
+	}
+
+	// JSON keeps the worker shape.
+	code, stdout, _ = run(t, "stats", "--json")
+	if code != 0 {
+		t.Fatalf("json exit = %d", code)
+	}
+	var view struct {
+		Apps []appStatsView `json:"apps"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &view); err != nil {
+		t.Fatalf("decode json: %v\n%s", err, stdout)
+	}
+	if len(view.Apps) != 2 || view.Apps[0].OOMKillCount != 2 {
+		t.Errorf("json apps = %+v", view.Apps)
+	}
+}

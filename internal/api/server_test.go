@@ -372,10 +372,11 @@ func TestDeploymentsEndpoints(t *testing.T) {
 
 // fakeWorker serves /logs over a Unix socket and records the query it saw.
 type fakeWorker struct {
-	query    url.Values
-	status   int
-	body     string
-	requests int
+	query     url.Values
+	status    int
+	body      string
+	statsBody string
+	requests  int
 }
 
 func (f *fakeWorker) start(t *testing.T, runDir string) {
@@ -398,6 +399,20 @@ func (f *fakeWorker) start(t *testing.T, runDir string) {
 		if f.body != "" {
 			_, _ = io.WriteString(w, f.body)
 		}
+	})
+	mux.HandleFunc("GET /stats", func(w http.ResponseWriter, _ *http.Request) {
+		f.requests++
+		status := f.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		body := f.statsBody
+		if body == "" {
+			body = `{"apps":[]}`
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
 	})
 	srv := &http.Server{Handler: mux}
 	go func() { _ = srv.Serve(ln) }()
@@ -523,6 +538,50 @@ func TestLogsProxyWithoutWorkerIs503(t *testing.T) {
 	resp, err := http.Get(srv.URL + "/apps/web/logs")
 	if err != nil {
 		t.Fatalf("GET logs: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	if code := errCode(t, resp); code != "E_WORKER_UNAVAILABLE" {
+		t.Errorf("code = %q, want E_WORKER_UNAVAILABLE", code)
+	}
+}
+
+func TestStatsProxyForwardsToWorkerSocket(t *testing.T) {
+	runDir := t.TempDir()
+	fw := &fakeWorker{statsBody: `{"apps":[{"name":"web","mem_usage_mb":12,"mem_limit_mb":64}]}`}
+	fw.start(t, runDir)
+	srv, _ := testServer(t, runDir)
+
+	resp, err := http.Get(srv.URL + "/stats")
+	if err != nil {
+		t.Fatalf("GET stats: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Errorf("content-type = %q", ct)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `"name":"web"`) {
+		t.Errorf("proxied body = %q", body)
+	}
+	if fw.requests != 1 {
+		t.Errorf("worker requests = %d, want 1", fw.requests)
+	}
+}
+
+func TestStatsProxyWithoutWorkerIs503(t *testing.T) {
+	runDir := t.TempDir() // no worker socket in there
+	srv, _ := testServer(t, runDir)
+
+	resp, err := http.Get(srv.URL + "/stats")
+	if err != nil {
+		t.Fatalf("GET stats: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable {

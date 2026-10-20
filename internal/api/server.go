@@ -6,6 +6,7 @@
 // Routes:
 //
 //	GET /healthz
+//	GET /stats live app resource view via the worker
 //	POST /apps create an app from a strict config object
 //	GET /apps list apps
 //	GET /apps/{name} show app + current deployment
@@ -267,6 +268,7 @@ func newMuxWith(s *store.Store, runDir string, logger *slog.Logger, resolve Reso
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", srv.handleHealthz)
+	mux.HandleFunc("GET /stats", srv.handleStats)
 	mux.HandleFunc("GET /budget", srv.handleBudget)
 	mux.HandleFunc("POST /budget", srv.handleSetBudget)
 	mux.HandleFunc("POST /apps", srv.handleCreateApp)
@@ -623,6 +625,37 @@ func (s *server) handleShowDeployment(w http.ResponseWriter, r *http.Request) {
 	dto := depToDTO(dep)
 	dto.Events = eventsToDTO(events)
 	writeJSON(w, http.StatusOK, dto)
+}
+
+// --- stats route -----------------------------------------------------
+
+// handleStats proxies the worker's resource view. The API holds no Docker
+// access, so the sample is taken by the worker and copied through.
+func (s *server) handleStats(w http.ResponseWriter, r *http.Request) {
+	s.proxyWorker(w, r, http.MethodGet, "http://worker/stats", nil)
+}
+
+// proxyWorker forwards one request to the worker socket and copies the
+// response back. The socket is the only API→worker channel.
+func (s *server) proxyWorker(w http.ResponseWriter, r *http.Request, method, target string, body io.Reader) {
+	req, err := http.NewRequestWithContext(r.Context(), method, target, body)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "E_INTERNAL", err.Error())
+		return
+	}
+	resp, err := s.workerClient.Do(req)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "E_WORKER_UNAVAILABLE",
+			fmt.Sprintf("worker socket unavailable at %s (is the worker running?): %v",
+				filepath.Join(s.runDir, worker.LogSockName), err))
+		return
+	}
+	defer resp.Body.Close()
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
 }
 
 // --- logs route ------------------------------------------------------
