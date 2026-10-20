@@ -294,12 +294,17 @@ func checkFiles(root string) []doctorCheck {
 func checkDisk(ctx context.Context, root string) []doctorCheck {
 	floor := store.DefaultMinFreeDiskMB
 	dbPath, _, _, _, _ := backupPaths(root)
-	if s, err := store.OpenPlain(dbPath); err == nil {
-		if settings, err := s.GetBudgetSettings(ctx); err == nil &&
-			settings.MinFreeDiskMB >= store.MinFreeDiskMBFloor {
-			floor = settings.MinFreeDiskMB
+	// Opening SQLite creates a missing file, which would turn the
+	// schema check's "database not found" into a misleading empty
+	// database. Doctor is read-only, so only read a DB that exists.
+	if _, err := os.Lstat(dbPath); err == nil {
+		if s, err := store.OpenPlain(dbPath); err == nil {
+			if settings, err := s.GetBudgetSettings(ctx); err == nil &&
+				settings.MinFreeDiskMB >= store.MinFreeDiskMBFloor {
+				floor = settings.MinFreeDiskMB
+			}
+			s.Close()
 		}
-		s.Close()
 	}
 	free, err := doctorStatfs(worker.DockerDataPath)
 	if err != nil {

@@ -209,6 +209,23 @@ func TestDoctorFailsBelowConfiguredDeployFloor(t *testing.T) {
 	}
 }
 
+func TestCheckDiskDoesNotCreateMissingDatabase(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "var/lib/tinyship"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db, _, _, _, _ := backupPaths(root)
+	stubDoctor(t, &doctorStatfs, func(string) (uint64, error) { return 20000, nil })
+
+	checks := checkDisk(context.Background(), root)
+	if len(checks) != 1 || checks[0].Status != doctorPass {
+		t.Fatalf("checks = %+v, want one passing disk check", checks)
+	}
+	if _, err := os.Lstat(db); !os.IsNotExist(err) {
+		t.Errorf("doctor created a database at %s (err = %v); it must stay read-only", db, err)
+	}
+}
+
 func TestDoctorFailReturnsNonZeroWithHints(t *testing.T) {
 	doctorHealthy(t)
 	// The engine is gone and both units are down: three failures.
