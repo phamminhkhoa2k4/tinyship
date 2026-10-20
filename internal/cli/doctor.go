@@ -316,7 +316,7 @@ func checkDisk(ctx context.Context, root string) []doctorCheck {
 			Name:   "disk",
 			Status: doctorFail,
 			Detail: fmt.Sprintf("free disk %d MiB is below the deploy floor %d MiB; admission will refuse a deploy", free, floor),
-			Hint:   "free space: tinyship gc --dry-run, docker system prune, remove old backups",
+			Hint:   "free space: inspect with tinyship gc --dry-run, remove with tinyship gc; or prune old backups",
 		}}
 	case free < uint64(doctorMinDiskMB):
 		return []doctorCheck{{
