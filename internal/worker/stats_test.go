@@ -4,6 +4,9 @@ import (
 	"context"
 	"log/slog"
 	"testing"
+
+	"github.com/tinyship/tinyship/internal/docker"
+	"github.com/tinyship/tinyship/internal/store"
 )
 
 func TestStatsSamplerReportsMemoryAndNearLimit(t *testing.T) {
@@ -86,5 +89,52 @@ func TestStatsSamplerCountsOOMOnce(t *testing.T) {
 	}
 	if apps[0].OOMKillCount != 1 {
 		t.Errorf("oom count = %d after re-sample, want 1", apps[0].OOMKillCount)
+	}
+}
+
+func TestOOMCountAccumulatesAcrossContainers(t *testing.T) {
+	fk := newFakeDocker()
+	fk.addContainer("seen-exit", "ts-seen", "exited", nil)
+	fk.containers["seen-exit"].oom = true
+	fk.addContainer("unseen-exit", "ts-unseen", "exited", nil)
+	fk.containers["unseen-exit"].oom = true
+	s := NewStatsSampler(nil, fk, slog.New(slog.DiscardHandler))
+	ctx := context.Background()
+
+	cases := []struct {
+		name    string
+		prev    *store.ContainerState
+		current docker.ContainerInfo
+		want    int
+	}{
+		{
+			name:    "an observed exit is not counted again when the container is replaced",
+			prev:    &store.ContainerState{ContainerID: "seen-exit", State: "exited", OOMKillCount: 1},
+			current: docker.ContainerInfo{ID: "new", State: "running"},
+			want:    1,
+		},
+		{
+			name:    "a replacement counts the previous container's unsampled kill",
+			prev:    &store.ContainerState{ContainerID: "unseen-exit", State: "running", OOMKillCount: 0},
+			current: docker.ContainerInfo{ID: "new", State: "running"},
+			want:    1,
+		},
+		{
+			name:    "the same container transitions from running to killed once",
+			prev:    &store.ContainerState{ContainerID: "unseen-exit", State: "running", OOMKillCount: 0},
+			current: docker.ContainerInfo{ID: "unseen-exit", State: "exited", OOMKilled: true},
+			want:    1,
+		},
+		{
+			name:    "a brand-new container that is already killed counts once",
+			prev:    nil,
+			current: docker.ContainerInfo{ID: "fresh", State: "exited", OOMKilled: true},
+			want:    1,
+		},
+	}
+	for _, tc := range cases {
+		if got := s.oomCount(ctx, tc.prev, tc.current); got != tc.want {
+			t.Errorf("%s: count = %d, want %d", tc.name, got, tc.want)
+		}
 	}
 }

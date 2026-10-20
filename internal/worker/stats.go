@@ -170,9 +170,12 @@ func (s *StatsSampler) oomCount(ctx context.Context, prev *store.ContainerState,
 	count := 0
 	if prev != nil {
 		count = prev.OOMKillCount
-		if prev.ContainerID != "" && prev.ContainerID != current.ID {
-			// The previous container was replaced; if it died of OOM and
-			// the event was never sampled, count it now.
+		if prev.ContainerID != "" && prev.ContainerID != current.ID &&
+			prev.State != "exited" && prev.State != "dead" {
+			// The previous container was replaced while we last saw it
+			// running; if it died of OOM and the event was never sampled,
+			// count it now. An already-observed exit was counted then, so
+			// re-inspecting it must not add a second kill.
 			if old, err := s.Docker.InspectContainer(ctx, prev.ContainerID); err == nil && old.OOMKilled {
 				count++
 			}
