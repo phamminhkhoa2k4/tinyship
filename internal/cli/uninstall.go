@@ -43,7 +43,7 @@ func uninstallRoot(flagRoot string) string {
 // the install root. An empty root means the real host: joining it with
 // a relative element would yield a cwd-relative path (and a purge that
 // silently removes nothing), so the empty root becomes "/" here.
-func uninstallPaths(root string) (units []string, dropin, tmpfiles, binary, baseline, etc, data, run string) {
+func uninstallPaths(root string) (units []string, dropin, oomDropin, tmpfiles, binary, baseline, etc, data, run string) {
 	base := root
 	if base == "" {
 		base = "/"
@@ -53,13 +53,14 @@ func uninstallPaths(root string) (units []string, dropin, tmpfiles, binary, base
 		filepath.Join(base, "etc/systemd/system/tinyship-worker.service"),
 	}
 	dropin = filepath.Join(base, "etc/systemd/system/caddy.service.d/tinyship.conf")
+	oomDropin = filepath.Join(base, "etc/systemd/system/caddy.service.d/tinyship-oom.conf")
 	tmpfiles = filepath.Join(base, "etc/tmpfiles.d/tinyship.conf")
 	binary = filepath.Join(base, "usr/local/bin/tinyship")
 	baseline = filepath.Join(base, "etc/caddy/caddy.json")
 	etc = filepath.Join(base, "etc/tinyship")
 	data = filepath.Join(base, "var/lib/tinyship")
 	run = filepath.Join(base, "run/tinyship")
-	return units, dropin, tmpfiles, binary, baseline, etc, data, run
+	return units, dropin, oomDropin, tmpfiles, binary, baseline, etc, data, run
 }
 
 // runDocker runs the docker CLI and returns its stdout. Tests stub it
@@ -176,7 +177,7 @@ so a later install resumes where this one stopped.
 		return 1
 	}
 
-	unitPaths, dropinPath, tmpfilesPath, binaryPath, baselinePath, etcPath, dataPath, runPath := uninstallPaths(root)
+	unitPaths, dropinPath, oomDropinPath, tmpfilesPath, binaryPath, baselinePath, etcPath, dataPath, runPath := uninstallPaths(root)
 
 	if *purge {
 		containers, volumes, network, err := managedDocker(ctx)
@@ -215,14 +216,14 @@ so a later install resumes where this one stopped.
 
 	stopServices(ctx, realHost, stdout, stderr)
 
-	// Control plane on every run: units, the proxy drop-in, the tmpfiles
+	// Control plane on every run: units, the proxy drop-ins, the tmpfiles
 	// snippet, the binary. The binary is removed last so this process
 	// keeps running from the unlinked inode (Linux allows that; the
 	// kernel holds the code). Upgrade leftovers live next to the binary
 	// and go with it: .prev is the rollback copy, .next and .next.part
 	// the staged candidate from an interrupted upgrade.
 	kill := append([]string{}, unitPaths...)
-	kill = append(kill, dropinPath, tmpfilesPath)
+	kill = append(kill, dropinPath, oomDropinPath, tmpfilesPath)
 	if *purge {
 		kill = append(kill, etcPath, dataPath, runPath, baselinePath)
 	}

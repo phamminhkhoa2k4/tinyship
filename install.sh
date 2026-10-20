@@ -276,36 +276,47 @@ EOF
     log "installed $path (proxy baseline; only the tinyship server subtree is ever replaced)"
 }
 
-# write_caddy_unit installs the systemd drop-in that points Caddy at
+# write_caddy_unit installs the systemd drop-ins that point Caddy at
 # the TinyShip baseline. The service group makes the admin socket group
 # caddy-admin, which tinyship-worker joins; RuntimeDirectory creates
 # /run/caddy. The OOM score keeps the proxy below app containers when
-# the kernel has to choose a victim. An existing file is never
-# overwritten.
+# the kernel has to choose a victim. The main drop-in is never
+# overwritten; the small OOM drop-in is added even when the main file
+# already exists, so an upgraded host gets the ordering too.
 write_caddy_unit() {
-    local caddy_bin dropin
+    local caddy_bin dropin oom_dropin
     caddy_bin=$(resolve_caddy)
     dropin="$INSTALL_ROOT/etc/systemd/system/caddy.service.d/tinyship.conf"
+    oom_dropin="$(dirname "$dropin")/tinyship-oom.conf"
     if [[ -z "$caddy_bin" ]]; then
-        warn "Caddy binary not found; skipping $dropin (install Caddy, then re-run the installer)"
+        warn "Caddy binary not found; skipping Caddy drop-ins (install Caddy, then re-run the installer)"
         return 0
     fi
     if [[ -e "$dropin" ]]; then
         log "existing $dropin kept (idempotent install)"
-        return 0
-    fi
-    install -d -m 0755 "$(dirname "$dropin")"
-    cat >"$dropin" <<EOF
+    else
+        install -d -m 0755 "$(dirname "$dropin")"
+        cat >"$dropin" <<EOF
 [Service]
 Group=caddy-admin
 RuntimeDirectory=caddy
 RuntimeDirectoryMode=0755
-OOMScoreAdjust=-500
 ExecStart=
 ExecStart=$caddy_bin run --config /etc/caddy/caddy.json
 EOF
-    chmod 0644 "$dropin"
-    log "installed $dropin (reload with: systemctl daemon-reload && systemctl restart caddy)"
+        chmod 0644 "$dropin"
+        log "installed $dropin (reload with: systemctl daemon-reload && systemctl restart caddy)"
+    fi
+    if [[ ! -e "$oom_dropin" ]] ||
+        ! grep -qxF "OOMScoreAdjust=-500" "$oom_dropin"; then
+        install -d -m 0755 "$(dirname "$oom_dropin")"
+        cat >"$oom_dropin" <<EOF
+[Service]
+OOMScoreAdjust=-500
+EOF
+        chmod 0644 "$oom_dropin"
+        log "installed $oom_dropin (reload with: systemctl daemon-reload && systemctl restart caddy)"
+    fi
 }
 
 install_from_local() {
