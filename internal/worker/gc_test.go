@@ -179,3 +179,39 @@ func TestGCUnknownApp(t *testing.T) {
 		t.Fatal("unknown app accepted")
 	}
 }
+
+func TestGCFilteredRunStillKeepsOtherAppsImages(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	cfgA := `{"name":"alpha","image":"traefik/whoami","tag":"v1","port":8080,"keep_releases":1}`
+	cfgB := `{"name":"beta","image":"traefik/whoami","tag":"v1","port":8080,"keep_releases":1}`
+	appA, err := s.CreateApp(ctx, store.CreateAppInput{Name: "alpha", ConfigJSON: cfgA, Actor: "cli"})
+	if err != nil {
+		t.Fatalf("create alpha: %v", err)
+	}
+	appB, err := s.CreateApp(ctx, store.CreateAppInput{Name: "beta", ConfigJSON: cfgB, Actor: "cli"})
+	if err != nil {
+		t.Fatalf("create beta: %v", err)
+	}
+
+	shared, newer := gcDigest(31), gcDigest(32)
+	addRelease(t, s, appA, cfgA, "traefik/whoami:v1", shared)
+	addRelease(t, s, appA, cfgA, "traefik/whoami:v1", newer)
+	addRelease(t, s, appB, cfgB, "traefik/whoami:v1", shared)
+
+	fk := newFakeDocker()
+	fk.images["traefik/whoami@"+shared] = 10
+	fk.images["traefik/whoami@"+newer] = 10
+
+	g := NewGCRunner(s, fk, "test-worker", slog.New(slog.DiscardHandler))
+	res, err := g.Run(ctx, GCOptions{App: "alpha"})
+	if err != nil {
+		t.Fatalf("filtered run: %v", err)
+	}
+	if len(res.Removed) != 0 {
+		t.Errorf("removed %+v, want the shared digest kept for beta", res.Removed)
+	}
+	if len(fk.removedIm) != 0 {
+		t.Errorf("docker removed %v, want nothing", fk.removedIm)
+	}
+}

@@ -81,13 +81,14 @@ type GCResult struct {
 
 // Run applies the retention policy once.
 func (g *GCRunner) Run(ctx context.Context, opts GCOptions) (*GCResult, error) {
-	apps, err := g.Store.ListApps(ctx)
+	allApps, err := g.Store.ListApps(ctx)
 	if err != nil {
 		return nil, err
 	}
+	apps := allApps
 	if opts.App != "" {
 		var selected []*store.App
-		for _, app := range apps {
+		for _, app := range allApps {
 			if app.Name == opts.App {
 				selected = append(selected, app)
 			}
@@ -98,14 +99,15 @@ func (g *GCRunner) Run(ctx context.Context, opts GCOptions) (*GCResult, error) {
 		apps = selected
 	}
 
-	// The keep set is global: two apps may run the same image, and a
-	// digest kept for either one must survive.
-	keep, err := g.keepSet(ctx, apps)
+	// The keep set always covers every app: two apps may run the same
+	// image, and a filtered run must not remove a digest that another
+	// app's retention window still protects.
+	keep, err := g.keepSet(ctx, allApps)
 	if err != nil {
 		return nil, err
 	}
 
-	res := &GCResult{DryRun: opts.DryRun}
+	res := &GCResult{DryRun: opts.DryRun, Removed: []GCImage{}}
 	seen := map[string]bool{}
 	for _, app := range apps {
 		if app.Deleting {
