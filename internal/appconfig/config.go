@@ -32,6 +32,9 @@ const (
 	DefaultPidsLimit    = 256
 	DefaultStopGraceS   = 30
 	DefaultStartPeriodS = 30 // health.start_period_s default
+	DefaultKeepReleases = 3  // images retained per app before gc may remove them
+	MinKeepReleases     = 1
+	MaxKeepReleases     = 50
 	MinMemoryMB         = 32
 	MinCPUMillis        = 50
 	MinPidsLimit        = 16
@@ -53,22 +56,26 @@ var (
 // Config is the validated app configuration. It is stored as JSON
 // in apps.config_json and snapshotted per deployment.
 type Config struct {
-	Name               string    `json:"name"`
-	Image              string    `json:"image"`
-	Tag                string    `json:"tag,omitempty"`
-	Digest             string    `json:"digest,omitempty"`
-	Port               int       `json:"port"`
-	Strategy           string    `json:"strategy,omitempty"`
-	Health             *Health   `json:"health,omitempty"`
-	Resources          Resources `json:"resources,omitempty"`
-	Command            []string  `json:"command,omitempty"`
-	User               string    `json:"user,omitempty"`
-	ReadOnlyRootfs     bool      `json:"read_only_rootfs,omitempty"`
-	Tmpfs              []Tmpfs   `json:"tmpfs,omitempty"`
-	Volumes            []Volume  `json:"volumes,omitempty"`
-	CapAdd             []string  `json:"cap_add,omitempty"`
-	StopGraceS         int       `json:"stop_grace_s,omitempty"`
-	RegistryCredential string    `json:"registry_credential,omitempty"`
+	Name           string    `json:"name"`
+	Image          string    `json:"image"`
+	Tag            string    `json:"tag,omitempty"`
+	Digest         string    `json:"digest,omitempty"`
+	Port           int       `json:"port"`
+	Strategy       string    `json:"strategy,omitempty"`
+	Health         *Health   `json:"health,omitempty"`
+	Resources      Resources `json:"resources,omitempty"`
+	Command        []string  `json:"command,omitempty"`
+	User           string    `json:"user,omitempty"`
+	ReadOnlyRootfs bool      `json:"read_only_rootfs,omitempty"`
+	Tmpfs          []Tmpfs   `json:"tmpfs,omitempty"`
+	Volumes        []Volume  `json:"volumes,omitempty"`
+	CapAdd         []string  `json:"cap_add,omitempty"`
+	StopGraceS     int       `json:"stop_grace_s,omitempty"`
+	// KeepReleases bounds how many successful releases keep their image
+	// on disk. Older images are removed by the garbage collector unless
+	// a container still uses them.
+	KeepReleases       int    `json:"keep_releases,omitempty"`
+	RegistryCredential string `json:"registry_credential,omitempty"`
 }
 
 // Health describes the host-run health probe.
@@ -175,6 +182,12 @@ func Validate(c *Config) (warnings []string, err error) {
 	}
 	if c.StopGraceS != 0 && (c.StopGraceS < 1 || c.StopGraceS > 300) {
 		add("stop_grace_s: %d out of range 1-300", c.StopGraceS)
+	}
+	if c.KeepReleases == 0 {
+		c.KeepReleases = DefaultKeepReleases
+	}
+	if c.KeepReleases < MinKeepReleases || c.KeepReleases > MaxKeepReleases {
+		add("keep_releases: %d out of range %d-%d", c.KeepReleases, MinKeepReleases, MaxKeepReleases)
 	}
 	if c.User != "" && !userRe.MatchString(c.User) {
 		add("user: %q must be numeric uid or uid:gid", c.User)

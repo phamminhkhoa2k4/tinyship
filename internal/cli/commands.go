@@ -109,6 +109,7 @@ Required (unless -f): --name, --image, --port.
 		pidsLimit   = fs.Int("pids-limit", 0, "max processes (default 256)")
 		strategy    = fs.String("strategy", "", "auto|start-first|stop-first (default auto)")
 		stopGrace   = fs.Int("stop-grace", 0, "SIGTERM grace seconds (default 30)")
+		keepRel     = fs.Int("keep-releases", 0, "successful releases whose images are kept (default 3)")
 		healthType  = fs.String("health-type", "", "health probe: http|tcp|exec (default tcp on --port)")
 		healthPath  = fs.String("health-path", "", "http probe path (default /)")
 		healthCmd   = fs.String("health-exec-cmd", "", "comma-separated exec probe command (runs in container)")
@@ -145,13 +146,14 @@ Required (unless -f): --name, --image, --port.
 			return 2
 		}
 		cfg := appconfig.Config{
-			Name:       *name,
-			Image:      *image,
-			Tag:        *tag,
-			Port:       *port,
-			Strategy:   *strategy,
-			StopGraceS: *stopGrace,
-			Volumes:    volumes,
+			Name:         *name,
+			Image:        *image,
+			Tag:          *tag,
+			Port:         *port,
+			Strategy:     *strategy,
+			StopGraceS:   *stopGrace,
+			KeepReleases: *keepRel,
+			Volumes:      volumes,
 		}
 		if *memoryMB > 0 || *cpuMillis > 0 || *pidsLimit > 0 {
 			cfg.Resources = appconfig.Resources{

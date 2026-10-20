@@ -148,6 +148,33 @@ func TestValidatePortStrategyResources(t *testing.T) {
 	}
 }
 
+func TestValidateKeepReleases(t *testing.T) {
+	// Absent means the documented default.
+	c := validConfig()
+	if _, err := Validate(c); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if c.KeepReleases != DefaultKeepReleases {
+		t.Errorf("keep_releases = %d, want default %d", c.KeepReleases, DefaultKeepReleases)
+	}
+
+	for _, n := range []int{MinKeepReleases, MaxKeepReleases} {
+		c = validConfig()
+		c.KeepReleases = n
+		if _, err := Validate(c); err != nil {
+			t.Errorf("keep_releases %d rejected: %v", n, err)
+		}
+	}
+
+	for _, n := range []int{-1, MaxKeepReleases + 1} {
+		c = validConfig()
+		c.KeepReleases = n
+		if _, err := Validate(c); err == nil || !strings.Contains(err.Error(), "keep_releases") {
+			t.Errorf("keep_releases %d = %v, want range error", n, err)
+		}
+	}
+}
+
 func TestValidateCapAddOnlyAllowlisted(t *testing.T) {
 	c := validConfig()
 	c.CapAdd = []string{"NET_ADMIN"}
