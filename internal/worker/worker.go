@@ -60,6 +60,7 @@ type Config struct {
 	WorkerID      string        // lease owner identity; default hostname-pid
 	ClaimInterval time.Duration // idle poll period; default 1s
 	ReapInterval  time.Duration // default store.ReapEvery
+	StatsInterval time.Duration // resource sampling period; default StatsInterval
 	Lease         time.Duration // claim lease duration; default store.LeaseDuration
 	BackoffBase   time.Duration // retry backoff base; default store.BackoffBase
 	Handlers      map[string]Handler
@@ -171,6 +172,9 @@ func RunStore(ctx context.Context, s *store.Store, cfg Config) error {
 	if cfg.ReapInterval <= 0 {
 		cfg.ReapInterval = store.ReapEvery
 	}
+	if cfg.StatsInterval <= 0 {
+		cfg.StatsInterval = StatsInterval
+	}
 	if cfg.Lease <= 0 {
 		cfg.Lease = store.LeaseDuration
 	}
@@ -203,6 +207,17 @@ func RunStore(ctx context.Context, s *store.Store, cfg Config) error {
 	// database row behind them. Nothing is remediated here.
 	bootReconcile(ctx, s, cfg.Docker, logger)
 
+	// Resource sampling backs both the CLI stats view and the durable
+	// OOM history. Sampling needs a daemon; without one the routes that
+	// depend on Docker are already unavailable.
+	var sampler *StatsSampler
+	if cfg.Docker != nil {
+		sampler = NewStatsSampler(s, cfg.Docker, logger)
+		if _, err := sampler.Sample(ctx); err != nil {
+			logger.Warn("worker: initial stats sample failed", "err", err)
+		}
+	}
+
 	// The read-only log socket: the API reaches container logs only
 	// through here, and only after the ownership checks.
 	if cfg.RunDir != "" {
@@ -213,6 +228,7 @@ func RunStore(ctx context.Context, s *store.Store, cfg Config) error {
 		if err != nil {
 			return fmt.Errorf("worker: log server: %w", err)
 		}
+		ls.Stats = sampler
 		var wg sync.WaitGroup
 		wg.Add(1)
 		go func() {
@@ -231,11 +247,22 @@ func RunStore(ctx context.Context, s *store.Store, cfg Config) error {
 	defer reap.Stop()
 	claim := time.NewTicker(cfg.ClaimInterval)
 	defer claim.Stop()
+	var stats <-chan time.Time
+	if sampler != nil {
+		tick := time.NewTicker(cfg.StatsInterval)
+		defer tick.Stop()
+		stats = tick.C
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-stats:
+			if _, err := sampler.Sample(ctx); err != nil {
+				// A missed sample only delays the next observation.
+				logger.Warn("worker: stats sample failed", "err", err)
+			}
 		case <-reap.C:
 			requeued, failed, err := s.ReapExpired(ctx, time.Now().UTC())
 			if err != nil {

@@ -31,13 +31,17 @@ const LogSockName = "worker.sock"
 // returns; --tail 0 means everything (the wrapper maps ≤0 to "all").
 const DefaultLogTail = 100
 
-// LogServer serves container logs over the worker's Unix socket.
+// LogServer serves container logs and the live resource view over the
+// worker's Unix socket.
 type LogServer struct {
 	Store    logStore
 	Docker   Docker
 	Actor    string
 	SockPath string
 	Logger   *slog.Logger
+	// Stats is shared with the worker loop; nil makes /stats unavailable
+	// (tests that do not exercise stats).
+	Stats *StatsSampler
 
 	server *http.Server
 	ln     net.Listener
@@ -110,6 +114,7 @@ func (l *LogServer) Close() error {
 func (l *LogServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /logs", l.handleLogs)
+	mux.HandleFunc("GET /stats", l.handleStats)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ok\n")
@@ -195,6 +200,24 @@ func (l *LogServer) handleLogs(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+// handleStats returns the sampled resource view for every app. Reading
+// triggers one fresh sample so the CLI sees current values, while the
+// stored sample keeps OOM history across worker restarts.
+func (l *LogServer) handleStats(w http.ResponseWriter, r *http.Request) {
+	if l.Stats == nil {
+		writeLogError(w, http.StatusServiceUnavailable, "E_STATS_UNAVAILABLE",
+			"the stats sampler is not running")
+		return
+	}
+	apps, err := l.Stats.Sample(r.Context())
+	if err != nil {
+		writeLogError(w, http.StatusBadGateway, "E_STATS_UNAVAILABLE", err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"apps": apps})
 }
 
 func writeLogError(w http.ResponseWriter, status int, code, message string) {

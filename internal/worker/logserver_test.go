@@ -36,6 +36,7 @@ func startLogServer(t *testing.T, f *deployFixture) (*http.Client, string, func(
 	if err != nil {
 		t.Fatalf("NewLogServer: %v", err)
 	}
+	ls.Stats = NewStatsSampler(f.s, f.fk, slog.New(slog.DiscardHandler))
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -187,6 +188,42 @@ func TestLogServerRefusesForeignContainersAndAudits(t *testing.T) {
 				t.Errorf("no audit row for refused read of %s", tc.containerID)
 			}
 		})
+	}
+}
+
+func TestLogServerStatsEndpoint(t *testing.T) {
+	f := newDeployFixture(t, happyConfig)
+	if err := f.run(1, 5); err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	f.fk.mu.Lock()
+	f.fk.statMemBytes = 8 << 20
+	f.fk.statMemLimit = 64 << 20
+	f.fk.mu.Unlock()
+
+	client, _, cleanup := startLogServer(t, f)
+	defer cleanup()
+
+	resp, err := client.Get("http://unix/stats")
+	if err != nil {
+		t.Fatalf("GET stats: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body = %s, want 200", resp.StatusCode, body)
+	}
+	var payload struct {
+		Apps []AppStats `json:"apps"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(payload.Apps) != 1 || payload.Apps[0].Name != "web" {
+		t.Fatalf("apps = %+v", payload.Apps)
+	}
+	if payload.Apps[0].MemUsageMB != 8 || payload.Apps[0].NearLimit {
+		t.Errorf("stats = %+v, want 8 MiB and not near the limit", payload.Apps[0])
 	}
 }
 
