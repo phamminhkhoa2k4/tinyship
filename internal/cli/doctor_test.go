@@ -146,6 +146,69 @@ func TestDoctorAllPassExitsZero(t *testing.T) {
 	}
 }
 
+func TestDoctorWarnsBetweenDeployFloorAndInstallerMinimum(t *testing.T) {
+	doctorHealthy(t)
+	stubDoctor(t, &doctorStatfs, func(string) (uint64, error) { return 4000, nil })
+	stubReconcile(t, map[string]bool{}, nil)
+	root := doctorRoot(t)
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/apps":
+			writeJSON(w, http.StatusOK, map[string]any{"apps": []any{}})
+		default:
+			writeErr(w, http.StatusNotFound, "E_NOT_FOUND", "x")
+		}
+	}))
+
+	code, stdout, stderr := run(t, "doctor", "--install-root", root)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (warn is not fail); stderr = %q\n%s", code, stderr, stdout)
+	}
+	for _, want := range []string{
+		"WARN disk", "below the installer minimum 5120 MiB", "above the deploy floor 3072 MiB",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout missing %q:\n%s", want, stdout)
+		}
+	}
+}
+
+func TestDoctorFailsBelowConfiguredDeployFloor(t *testing.T) {
+	doctorHealthy(t)
+	stubDoctor(t, &doctorStatfs, func(string) (uint64, error) { return 3500, nil })
+	stubReconcile(t, map[string]bool{}, nil)
+	root := doctorRoot(t)
+	db, _, _, _, _ := backupPaths(root)
+	s, err := store.OpenPlain(db)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	if err := s.SetMinFreeDiskMB(context.Background(), 4000); err != nil {
+		t.Fatalf("set disk floor: %v", err)
+	}
+	s.Close()
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/apps":
+			writeJSON(w, http.StatusOK, map[string]any{"apps": []any{}})
+		default:
+			writeErr(w, http.StatusNotFound, "E_NOT_FOUND", "x")
+		}
+	}))
+
+	code, stdout, _ := run(t, "doctor", "--install-root", root)
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1 below the deploy floor\n%s", code, stdout)
+	}
+	for _, want := range []string{
+		"FAIL disk", "below the deploy floor 4000 MiB", "admission will refuse a deploy",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout missing %q:\n%s", want, stdout)
+		}
+	}
+}
+
 func TestDoctorFailReturnsNonZeroWithHints(t *testing.T) {
 	doctorHealthy(t)
 	// The engine is gone and both units are down: three failures.

@@ -29,6 +29,7 @@ import (
 
 	"github.com/tinyship/tinyship/internal/appconfig"
 	"github.com/tinyship/tinyship/internal/reconcile"
+	"github.com/tinyship/tinyship/internal/worker"
 )
 
 // flagSet builds a flag set that prints usage to stderr and maps -h to the
@@ -707,7 +708,13 @@ func cmdStatus(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	// containers actually running. Docker being unavailable degrades
 	// the line to unknown instead of failing status itself.
 	rep, rerr := statusReconcile(ctx, apps)
-	warning := remoteListenWarning(health.TCPListen)
+	warnings := []string{}
+	if w := remoteListenWarning(health.TCPListen); w != "" {
+		warnings = append(warnings, w)
+	}
+	if w := diskFloorWarning(ctx, c); w != "" {
+		warnings = append(warnings, w)
+	}
 	if *jsonOut {
 		out := map[string]any{"api": health, "apps": apps}
 		if rerr != nil {
@@ -715,16 +722,16 @@ func cmdStatus(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		} else {
 			out["reconcile"] = rep
 		}
-		if warning != "" {
-			out["warnings"] = []string{warning}
+		if len(warnings) > 0 {
+			out["warnings"] = warnings
 		}
 		raw, _ := json.Marshal(out)
 		fmt.Fprintln(stdout, string(raw))
 		return 0
 	}
 	fmt.Fprintf(stdout, "API     %s (version %s, commit %s)\n", strings.ToUpper(health.Status), health.Version, health.Commit)
-	if warning != "" {
-		fmt.Fprintf(stdout, "WARNING %s\n", warning)
+	for _, w := range warnings {
+		fmt.Fprintf(stdout, "WARNING %s\n", w)
 	}
 	fmt.Fprintf(stdout, "Apps    %d\n", len(apps))
 	for _, a := range apps {
@@ -826,13 +833,35 @@ func remoteListenWarning(tcpListen string) string {
 	return fmt.Sprintf("the API is listening on %s and is reachable from the network; anyone with the admin token can control this host", tcpListen)
 }
 
+// diskFloorWarning compares the Docker data filesystem with the
+// configured deploy floor. A missing budget view or an unreadable
+// filesystem is unknown, not a warning: status stays useful on a host
+// where the CLI lacks Docker's group.
+func diskFloorWarning(ctx context.Context, c *apiClient) string {
+	var view budgetView
+	if err := c.doJSON(ctx, http.MethodGet, "/budget", nil, &view); err != nil {
+		return ""
+	}
+	free, err := diskFreeMB(worker.DockerDataPath)
+	if err != nil {
+		return ""
+	}
+	if free >= view.MinFreeDiskMB {
+		return ""
+	}
+	return fmt.Sprintf("free disk %d MiB on %s is below the deploy floor %d MiB; new deploys will be refused until space is freed",
+		free, worker.DockerDataPath, view.MinFreeDiskMB)
+}
+
 // budgetGrantView is one app's memory grant in the budget response.
 type budgetGrantView struct {
 	Name     string `json:"name"`
 	MemoryMB int    `json:"memory_mb"`
 }
 
-// budgetView is the API's budget response.
+// budgetView is the API's budget response, plus the local disk reading
+// the CLI adds for display. The API cannot stat Docker's data directory
+// itself because it runs without Docker's group.
 type budgetView struct {
 	BudgetMB      int               `json:"budget_mb"`
 	BudgetSource  string            `json:"budget_source"`
@@ -840,22 +869,29 @@ type budgetView struct {
 	CommittedMB   int               `json:"committed_mb"`
 	FreeMB        int               `json:"free_mb"`
 	MinFreeDiskMB int               `json:"min_free_disk_mb"`
+	DiskFreeMB    *int              `json:"disk_free_mb,omitempty"`
 	CPUOvercommit float64           `json:"cpu_overcommit"`
 	Apps          []budgetGrantView `json:"apps"`
 }
 
 func cmdBudget(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	fs := flagSet("budget", stderr, `usage: tinyship budget [--set-mb N] [--json]
+	fs := flagSet("budget", stderr, `usage: tinyship budget [--set-mb N] [--set-min-free-disk N] [--json]
 
-Show the host RAM budget: what apps may claim in total, what each
-running app currently holds, and what remains. The admission guard
-enforces granted limits, not live usage; a deploy that would push the
-total past the budget is refused at the admission step.
+Show the host budget: what apps may claim in RAM in total, what each
+running app currently holds, and the free-disk floor that admission
+enforces before pulling an image. The admission guard enforces granted
+limits, not live usage; a deploy that would push the total past the
+budget is refused at the admission step.
 
---set-mb N overrides the budget explicitly (0 restores the automatic
+--set-mb N overrides the RAM budget explicitly (0 restores the automatic
 derivation from the host's total RAM).
+
+--set-min-free-disk N sets the free-disk floor in MiB (256-102400).
+A deploy is refused before pulling when the Docker data filesystem has
+less free space than this.
 `)
 	setMB := fs.Int("set-mb", -1, "override the host RAM budget in MiB; 0 restores auto")
+	setDisk := fs.Int("set-min-free-disk", -1, "override the free-disk floor in MiB")
 	jsonOut := fs.Bool("json", false, "print machine-readable output")
 	pos, code := parseFlags(fs, args)
 	if code >= 0 {
@@ -867,21 +903,36 @@ derivation from the host's total RAM).
 	}
 
 	c := newAPIClient()
+	body := map[string]any{}
 	if *setMB >= 0 {
-		body, _ := json.Marshal(map[string]any{"budget_mb": *setMB})
+		body["budget_mb"] = *setMB
+	}
+	if *setDisk >= 0 {
+		body["min_free_disk_mb"] = *setDisk
+	}
+	if len(body) > 0 {
+		raw, _ := json.Marshal(body)
 		var view budgetView
-		if err := c.doJSON(ctx, http.MethodPost, "/budget", body, &view); err != nil {
+		if err := c.doJSON(ctx, http.MethodPost, "/budget", raw, &view); err != nil {
 			fmt.Fprintf(stderr, "tinyship budget: %v\n", err)
 			return 1
 		}
 		if !*jsonOut {
-			fmt.Fprintf(stdout, "Budget set to %s\n", describeBudget(*setMB, &view))
+			if *setMB >= 0 {
+				fmt.Fprintf(stdout, "Budget set to %s\n", describeBudget(*setMB, &view))
+			}
+			if *setDisk >= 0 {
+				fmt.Fprintf(stdout, "Disk floor set to %d MiB\n", *setDisk)
+			}
 		}
 	}
 	var view budgetView
 	if err := c.doJSON(ctx, http.MethodGet, "/budget", nil, &view); err != nil {
 		fmt.Fprintf(stderr, "tinyship budget: %v\n", err)
 		return 1
+	}
+	if free, err := diskFreeMB(worker.DockerDataPath); err == nil {
+		view.DiskFreeMB = &free
 	}
 	if *jsonOut {
 		raw, _ := json.Marshal(view)
@@ -893,11 +944,20 @@ derivation from the host's total RAM).
 	fmt.Fprintf(stdout, "Committed  %d MiB across %d running app(s)\n",
 		view.CommittedMB, len(view.Apps))
 	fmt.Fprintf(stdout, "Free       %d MiB\n", view.FreeMB)
+	fmt.Fprintf(stdout, "Disk floor %d MiB\n", view.MinFreeDiskMB)
+	if view.DiskFreeMB != nil {
+		fmt.Fprintf(stdout, "Disk free  %d MiB on %s\n", *view.DiskFreeMB, worker.DockerDataPath)
+	} else {
+		fmt.Fprintf(stdout, "Disk free  unknown on %s\n", worker.DockerDataPath)
+	}
 	for _, a := range view.Apps {
 		fmt.Fprintf(stdout, "  %-20s %4d MiB\n", a.Name, a.MemoryMB)
 	}
 	if view.FreeMB < 0 {
 		fmt.Fprintln(stdout, "Warning: apps hold more than the budget; new deploys will be refused until grants are lowered or apps are stopped.")
+	}
+	if view.DiskFreeMB != nil && *view.DiskFreeMB < view.MinFreeDiskMB {
+		fmt.Fprintln(stdout, "Warning: free disk is below the deploy floor; new deploys will be refused until space is freed.")
 	}
 	return 0
 }

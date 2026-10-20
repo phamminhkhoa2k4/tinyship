@@ -21,6 +21,7 @@ import (
 	"github.com/tinyship/tinyship/internal/docker"
 	"github.com/tinyship/tinyship/internal/policy"
 	"github.com/tinyship/tinyship/internal/store"
+	"github.com/tinyship/tinyship/internal/worker"
 )
 
 // Injection points let tests exercise each verdict without a host
@@ -100,7 +101,7 @@ on the host is changed. Exits non-zero when any check fails.
 	checks = append(checks, checkDocker(ctx)...)
 	checks = append(checks, checkProxy(ctx)...)
 	checks = append(checks, checkFiles(root)...)
-	checks = append(checks, checkDisk(root)...)
+	checks = append(checks, checkDisk(ctx, root)...)
 	checks = append(checks, checkServices(ctx)...)
 	checks = append(checks, checkSchema(ctx, root)...)
 
@@ -287,34 +288,48 @@ func checkFiles(root string) []doctorCheck {
 	return checks
 }
 
-// checkDisk keeps the installer's free-space floor visible: images,
-// containers and backups all grow from it.
-func checkDisk(root string) []doctorCheck {
-	path := root
-	if path == "" {
-		path = "/"
+// checkDisk compares the filesystem that holds Docker's data with the
+// deploy floor admission enforces, then with the installer's minimum.
+// A host between the two can still deploy; it is low, not broken.
+func checkDisk(ctx context.Context, root string) []doctorCheck {
+	floor := store.DefaultMinFreeDiskMB
+	dbPath, _, _, _, _ := backupPaths(root)
+	if s, err := store.OpenPlain(dbPath); err == nil {
+		if settings, err := s.GetBudgetSettings(ctx); err == nil &&
+			settings.MinFreeDiskMB >= store.MinFreeDiskMBFloor {
+			floor = settings.MinFreeDiskMB
+		}
+		s.Close()
 	}
-	free, err := doctorStatfs(path)
+	free, err := doctorStatfs(worker.DockerDataPath)
 	if err != nil {
 		return []doctorCheck{{
 			Name:   "disk",
 			Status: doctorFail,
-			Detail: "cannot stat " + path + ": " + firstLine(err.Error()),
-			Hint:   "check the filesystem holding the install root",
+			Detail: "cannot stat " + worker.DockerDataPath + ": " + firstLine(err.Error()),
+			Hint:   "check the filesystem holding the Docker data directory",
 		}}
 	}
-	if free < doctorMinDiskMB {
+	switch {
+	case free < uint64(floor):
 		return []doctorCheck{{
 			Name:   "disk",
 			Status: doctorFail,
-			Detail: fmt.Sprintf("free disk %d MiB is below the %d MiB minimum", free, doctorMinDiskMB),
-			Hint:   "free space: docker system prune, remove old backups",
+			Detail: fmt.Sprintf("free disk %d MiB is below the deploy floor %d MiB; admission will refuse a deploy", free, floor),
+			Hint:   "free space: tinyship gc --dry-run, docker system prune, remove old backups",
+		}}
+	case free < uint64(doctorMinDiskMB):
+		return []doctorCheck{{
+			Name:   "disk",
+			Status: doctorWarn,
+			Detail: fmt.Sprintf("free disk %d MiB is below the installer minimum %d MiB but above the deploy floor %d MiB", free, doctorMinDiskMB, floor),
+			Hint:   "existing deploys still work; free space before a fresh install: tinyship gc",
 		}}
 	}
 	return []doctorCheck{{
 		Name:   "disk",
 		Status: doctorPass,
-		Detail: fmt.Sprintf("free disk %d MiB (>= %d required)", free, doctorMinDiskMB),
+		Detail: fmt.Sprintf("free disk %d MiB (deploy floor %d MiB, installer minimum %d MiB)", free, floor, doctorMinDiskMB),
 	}}
 }
 

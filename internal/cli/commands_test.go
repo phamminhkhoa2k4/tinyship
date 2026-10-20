@@ -43,6 +43,15 @@ func writeErr(w http.ResponseWriter, status int, code, msg string) {
 	})
 }
 
+// stubDiskFree makes the local disk reading deterministic for commands
+// that add a host-side warning to otherwise scripted API responses.
+func stubDiskFree(t *testing.T, free int, err error) {
+	t.Helper()
+	prev := diskFreeMB
+	diskFreeMB = func(string) (int, error) { return free, err }
+	t.Cleanup(func() { diskFreeMB = prev })
+}
+
 // --- app create ------------------------------------------------------------------
 
 func TestAppCreateFromFlagsSendsStrictConfig(t *testing.T) {
@@ -627,6 +636,7 @@ func TestStatusUnreachableExitsOne(t *testing.T) {
 // --- budget --------------------------------------------------------------------
 
 func TestBudgetRendersGrantsAndFree(t *testing.T) {
+	stubDiskFree(t, 4096, nil)
 	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/budget" {
 			t.Errorf("request = %s %s, want GET /budget", r.Method, r.URL.Path)
@@ -646,10 +656,35 @@ func TestBudgetRendersGrantsAndFree(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit = %d, stderr = %q", code, stderr)
 	}
-	for _, want := range []string{"2048 MiB", "configured", "Committed  768 MiB", "Free       1280 MiB", "web", "api"} {
+	for _, want := range []string{
+		"2048 MiB", "configured", "Committed  768 MiB", "Free       1280 MiB",
+		"Disk floor 3072 MiB", "Disk free  4096 MiB", "web", "api",
+	} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("stdout missing %q:\n%s", want, stdout)
 		}
+	}
+	if strings.Contains(stdout, "Warning: free disk") {
+		t.Errorf("disk above the floor must not warn:\n%s", stdout)
+	}
+}
+
+func TestBudgetWarnsWhenDiskBelowFloor(t *testing.T) {
+	stubDiskFree(t, 1024, nil)
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"budget_mb": 2048, "budget_source": "configured", "mem_total_mb": 4096,
+			"committed_mb": 0, "free_mb": 2048, "min_free_disk_mb": 3072,
+			"cpu_overcommit": 2.0, "apps": []any{},
+		})
+	}))
+
+	code, stdout, stderr := run(t, "budget")
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q", code, stderr)
+	}
+	if !strings.Contains(stdout, "Warning: free disk is below the deploy floor") {
+		t.Errorf("budget must warn about low disk:\n%s", stdout)
 	}
 }
 
@@ -685,6 +720,51 @@ func TestBudgetSetMBPostsOverride(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "Budget set to 1024 MiB") {
 		t.Errorf("stdout missing confirmation:\n%s", stdout)
+	}
+}
+
+func TestBudgetSetMinFreeDiskPostsOverride(t *testing.T) {
+	stubDiskFree(t, 8192, nil)
+	var got map[string]any
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/budget":
+			var body map[string]any
+			json.NewDecoder(r.Body).Decode(&body)
+			got = body
+			writeJSON(w, http.StatusOK, map[string]any{
+				"budget_mb": 2048, "budget_source": "configured", "mem_total_mb": 4096,
+				"committed_mb": 0, "free_mb": 2048, "min_free_disk_mb": 4096,
+				"apps": []map[string]any{},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/budget":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"budget_mb": 2048, "budget_source": "configured", "mem_total_mb": 4096,
+				"committed_mb": 0, "free_mb": 2048, "min_free_disk_mb": 4096,
+				"apps": []map[string]any{},
+			})
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			writeErr(w, http.StatusNotFound, "E_NOT_FOUND", "x")
+		}
+	}))
+
+	code, stdout, stderr := run(t, "budget", "--set-min-free-disk", "4096")
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q, stdout = %q", code, stderr, stdout)
+	}
+	if got == nil || got["min_free_disk_mb"] != float64(4096) {
+		t.Errorf("posted body = %v, want min_free_disk_mb 4096", got)
+	}
+	if _, ok := got["budget_mb"]; ok {
+		t.Errorf("posted body = %v, must not include budget_mb when only the floor is set", got)
+	}
+	for _, want := range []string{
+		"Disk floor set to 4096 MiB", "Disk floor 4096 MiB", "Disk free  8192 MiB",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout missing %q:\n%s", want, stdout)
+		}
 	}
 }
 
@@ -924,6 +1004,7 @@ func statusAPI(t *testing.T, tcpListen string) {
 	// Deterministic drift line: the docker lookup is stubbed so these
 	// warning assertions never depend on the host's containers.
 	stubReconcile(t, map[string]bool{}, nil)
+	stubDiskFree(t, 20000, nil)
 	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/healthz":
@@ -933,6 +1014,8 @@ func statusAPI(t *testing.T, tcpListen string) {
 			})
 		case r.URL.Path == "/apps":
 			writeJSON(w, http.StatusOK, map[string]any{"apps": []any{}})
+		case r.URL.Path == "/budget":
+			writeJSON(w, http.StatusOK, map[string]any{"min_free_disk_mb": 3072})
 		default:
 			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
 			writeErr(w, http.StatusNotFound, "E_NOT_FOUND", "x")
@@ -978,6 +1061,20 @@ func TestStatusStaysQuietOnLoopbackListen(t *testing.T) {
 	}
 	if strings.Contains(stdout, "WARNING") {
 		t.Errorf("loopback listen must not warn:\n%s", stdout)
+	}
+}
+
+func TestStatusWarnsWhenDiskBelowFloor(t *testing.T) {
+	statusAPI(t, "127.0.0.1:7878")
+	stubDiskFree(t, 1024, nil)
+	code, stdout, _ := run(t, "status")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stdout = %q", code, stdout)
+	}
+	for _, want := range []string{"WARNING", "below the deploy floor 3072 MiB", "1024 MiB"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("status must warn about low disk, missing %q:\n%s", want, stdout)
+		}
 	}
 }
 
