@@ -768,6 +768,29 @@ func TestBudgetSetMinFreeDiskPostsOverride(t *testing.T) {
 	}
 }
 
+func TestBudgetRejectsNegativeDiskFloor(t *testing.T) {
+	var got map[string]any
+	apiFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/budget" {
+			t.Errorf("request = %s %s, want POST /budget", r.Method, r.URL.Path)
+		}
+		json.NewDecoder(r.Body).Decode(&got)
+		writeErr(w, http.StatusBadRequest, "E_VALIDATION",
+			"min_free_disk_mb must be between 256 and 102400")
+	}))
+
+	code, _, stderr := run(t, "budget", "--set-min-free-disk", "-1")
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1 for a rejected floor; stderr = %q", code, stderr)
+	}
+	if got == nil || got["min_free_disk_mb"] != float64(-1) {
+		t.Errorf("posted body = %v, want the explicit negative value sent for validation", got)
+	}
+	if !strings.Contains(stderr, "min_free_disk_mb must be between 256 and 102400") {
+		t.Errorf("stderr missing the validation error:\n%s", stderr)
+	}
+}
+
 func TestBudgetRejectsPositionalArgument(t *testing.T) {
 	code, _, stderr := run(t, "budget", "extra")
 	if code != 2 {

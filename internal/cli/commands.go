@@ -901,13 +901,25 @@ less free space than this.
 		fmt.Fprintf(stderr, "tinyship budget: unexpected argument %q\n", pos[0])
 		return 2
 	}
+	// Sentinels distinguish "not set" from an explicit value. Tracking
+	// the flags lets the API reject an explicit negative value instead
+	// of this command silently treating it as absent.
+	setMBFlag, setDiskFlag := false, false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "set-mb":
+			setMBFlag = true
+		case "set-min-free-disk":
+			setDiskFlag = true
+		}
+	})
 
 	c := newAPIClient()
 	body := map[string]any{}
-	if *setMB >= 0 {
+	if setMBFlag {
 		body["budget_mb"] = *setMB
 	}
-	if *setDisk >= 0 {
+	if setDiskFlag {
 		body["min_free_disk_mb"] = *setDisk
 	}
 	if len(body) > 0 {
@@ -918,10 +930,10 @@ less free space than this.
 			return 1
 		}
 		if !*jsonOut {
-			if *setMB >= 0 {
+			if setMBFlag {
 				fmt.Fprintf(stdout, "Budget set to %s\n", describeBudget(*setMB, &view))
 			}
-			if *setDisk >= 0 {
+			if setDiskFlag {
 				fmt.Fprintf(stdout, "Disk floor set to %d MiB\n", *setDisk)
 			}
 		}
