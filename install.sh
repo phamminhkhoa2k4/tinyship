@@ -5,14 +5,12 @@
 # - preflight is complete and non-destructive: supported OS,
 # available RAM, free disk, ports 80/443, Docker presence/version;
 # `--check-only` runs preflight and exits without changing anything.
-# - install supports `--from-local <path-to-binary>` (dev/self-host path)
-# and wires a working host: Docker Engine through apt when missing, the
-# two hardened systemd services (started now, restarted on boot), the
-# sealed-secret key pair, the host config file, the proxy baseline, and
-# the first admin token.
-# The download-from-release path (checksum verification)
-# activates once releases exist; until then the script refuses to guess
-# a download URL.
+# - install supports a release download (default: latest) and
+# `--from-local <path-to-binary>` for development. Release installs verify
+# the published SHA-256 checksum before writing anything, then wire the
+# host: Docker Engine through apt when missing, the two hardened systemd
+# services (started now, restarted on boot), the sealed-secret key pair,
+# the host config file, the proxy baseline, and the first admin token.
 #
 # Provisional thresholds: every number here must be re-tuned by
 # the benchmark before release.
@@ -21,10 +19,14 @@ set -euo pipefail
 MIN_RAM_MB=1024       # provisional minimum available RAM
 MIN_DISK_MB=5120      # provisional minimum free disk on /
 DOCKER_MIN_API=1.43   # Docker Engine 24.0
+DEFAULT_RELEASE_BASE="https://github.com/tinyship/tinyship/releases"
 
 CHECK_ONLY=0
 ASSUME_YES=0
 FROM_LOCAL=""
+RELEASE_VERSION=""
+RELEASE_BIN=""
+RELEASE_TMP=""
 API_LISTEN=""        # optional explicit API TCP address (loopback unless --api-listen says otherwise)
 # TINYSHIP_INSTALL_ROOT prefixes every path the installer writes. It
 # exists for development and test hosts: a sandbox install writes files
@@ -50,6 +52,7 @@ Options:
   --check-only        Run preflight only; change nothing, exit non-zero on failure
   --yes               Non-interactive mode (assume yes for prompts, including
                       the Docker install)
+  --version VERSION   Install a specific release tag (vX.Y.Z); default: latest
   --from-local PATH   Install the given locally built tinyship binary
   --api-listen ADDR   Serve the API on ADDR (host:port). A loopback address
                       behaves like the default; any other address also passes
@@ -60,6 +63,8 @@ Options:
 Environment:
   TINYSHIP_INSTALL_ROOT  Write under this prefix instead of / (dev/test only;
                          skips users, groups, services, and the port checks)
+  TINYSHIP_RELEASE_URL   Fetch release files from this directory instead of
+                         the public release URL (testing and mirrors)
 
 What a full install does: preflight, Docker Engine via apt when missing
 (prompted unless --yes), the two systemd services with hardening and
@@ -319,9 +324,81 @@ EOF
     fi
 }
 
-install_from_local() {
+normalize_version() {
+    local v=${1#v}
+    [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]] || return 1
+    printf '%s\n' "$v"
+}
+
+release_dir() {
+    if [[ -n "${TINYSHIP_RELEASE_URL:-}" ]]; then
+        printf '%s\n' "${TINYSHIP_RELEASE_URL%/}"
+        return
+    fi
+    if [[ "$RELEASE_VERSION" == "latest" ]]; then
+        printf '%s/latest/download\n' "$DEFAULT_RELEASE_BASE"
+    else
+        printf '%s/download/v%s\n' "$DEFAULT_RELEASE_BASE" "$RELEASE_VERSION"
+    fi
+}
+
+# download_release fetches the binary and its checksum into a private
+# temporary directory, verifies the checksum, and leaves the path in
+# RELEASE_BIN. Temporary files are removed on exit whether or not the
+# install continues.
+download_release() {
+    local url tmp bin count line got
+    url=$(release_dir)
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/tinyship-release.XXXXXX")
+    RELEASE_TMP=$tmp
+    trap 'if [[ -n "${RELEASE_TMP:-}" ]]; then rm -rf "$RELEASE_TMP"; fi' EXIT
+
+    log "downloading release from $url"
+    if ! curl -fsSL --retry 2 --connect-timeout 10 --max-time 120 \
+        "$url/tinyship-linux-amd64" -o "$tmp/tinyship-linux-amd64"; then
+        fail "could not download the release binary from $url"
+        return 1
+    fi
+    if ! curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 \
+        "$url/SHA256SUMS" -o "$tmp/SHA256SUMS"; then
+        fail "could not download SHA256SUMS from $url"
+        return 1
+    fi
+
+    checksum_re='^[0-9a-fA-F]{64}[[:space:]]+\*?tinyship-linux-amd64$'
+    count=$(grep -cE "$checksum_re" "$tmp/SHA256SUMS" 2>/dev/null || true)
+    if [[ "$count" != "1" ]]; then
+        fail "SHA256SUMS must contain exactly one checksum for tinyship-linux-amd64 (found $count)"
+        return 1
+    fi
+    line=$(grep -E "$checksum_re" "$tmp/SHA256SUMS" | head -n 1)
+    if ! (cd "$tmp" && printf '%s\n' "$line" | sha256sum -c - >/dev/null 2>&1); then
+        fail "checksum verification failed for tinyship-linux-amd64"
+        return 1
+    fi
+    chmod 0755 "$tmp/tinyship-linux-amd64"
+
+    bin=$tmp/tinyship-linux-amd64
+    if ! version_out=$("$bin" version 2>&1); then
+        fail "downloaded binary cannot report its version: $version_out"
+        return 1
+    fi
+    got=$(printf '%s\n' "$version_out" | awk '$1 == "Version" {print $2; exit}')
+    if [[ -z "$got" ]]; then
+        fail "downloaded binary did not report a version"
+        return 1
+    fi
+    if [[ "$RELEASE_VERSION" != "latest" && "$got" != "$RELEASE_VERSION" ]]; then
+        fail "downloaded version $got does not match requested version $RELEASE_VERSION"
+        return 1
+    fi
+    log "verified release $got (sha256 ok)"
+    RELEASE_BIN=$bin
+}
+
+install_binary() {
     local src=$1
-    [[ -x "$src" ]] || { fail "--from-local path is not an executable: $src"; return 1; }
+    [[ -x "$src" ]] || { fail "install source is not executable: $src"; return 1; }
 
     if sandbox; then
         log "sandbox mode: writing under $INSTALL_ROOT only (no users, groups, or services are touched)"
@@ -692,6 +769,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --check-only) CHECK_ONLY=1 ;;
         --yes)        ASSUME_YES=1 ;;
+        --version)    shift; RELEASE_VERSION="${1:-}"; [[ -n "$RELEASE_VERSION" ]] || { fail "--version needs a version"; exit 2; } ;;
         --from-local) shift; FROM_LOCAL="${1:-}"; [[ -n "$FROM_LOCAL" ]] || { fail "--from-local needs a path"; exit 2; } ;;
         --api-listen) shift; API_LISTEN="${1:-}"
                     [[ "$API_LISTEN" == *:* ]] || { fail "--api-listen needs a host:port address"; exit 2; } ;;
@@ -700,6 +778,16 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
+
+if [[ -n "$FROM_LOCAL" && -n "$RELEASE_VERSION" ]]; then
+    fail "--from-local and --version are mutually exclusive"
+    exit 2
+fi
+if [[ -z "$RELEASE_VERSION" ]]; then
+    RELEASE_VERSION=latest
+elif [[ "$RELEASE_VERSION" != "latest" ]]; then
+    RELEASE_VERSION=$(normalize_version "$RELEASE_VERSION") || { fail "--version must be latest or a semver tag like v0.1.0"; exit 2; }
+fi
 
 if preflight; then
     log "preflight: PASS"
@@ -714,7 +802,18 @@ if (( CHECK_ONLY )); then
 fi
 
 if [[ -z "$FROM_LOCAL" ]]; then
-    fail "no install method given; this pre-release revision supports --from-local PATH (release downloads are not available yet)"
+    if ! sandbox && [[ $EUID -ne 0 ]]; then
+        fail "install requires root (re-run with sudo); preflight does not"
+        exit 1
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        fail "curl is required to download a release (use --from-local on an offline host)"
+        exit 1
+    fi
+    download_release || exit 1
+    FROM_LOCAL=$RELEASE_BIN
+elif [[ ! -x "$FROM_LOCAL" ]]; then
+    fail "--from-local path is not an executable: $FROM_LOCAL"
     exit 2
 fi
 
@@ -726,4 +825,4 @@ if ! command -v docker >/dev/null 2>&1; then
     exit 1
 fi
 
-install_from_local "$FROM_LOCAL"
+install_binary "$FROM_LOCAL"
