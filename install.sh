@@ -434,7 +434,7 @@ install_binary() {
 
     install -d -m 0755 "$INSTALL_ROOT/usr/local/bin"
     if [[ -x "$INSTALL_ROOT/usr/local/bin/tinyship" ]]; then
-        log "existing $INSTALL_ROOT/usr/local/bin/tinyship kept (idempotent install)"
+        log "existing $INSTALL_ROOT/usr/local/bin/tinyship kept (idempotent install; use tinyship upgrade to change it)"
     else
         install -m 0755 "$src" "$INSTALL_ROOT/usr/local/bin/tinyship"
         log "installed $INSTALL_ROOT/usr/local/bin/tinyship"
