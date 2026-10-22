@@ -19,7 +19,7 @@ set -euo pipefail
 MIN_RAM_MB=1024       # provisional minimum available RAM
 MIN_DISK_MB=5120      # provisional minimum free disk on /
 DOCKER_MIN_API=1.43   # Docker Engine 24.0
-DEFAULT_RELEASE_BASE="https://github.com/tinyship/tinyship/releases"
+DEFAULT_RELEASE_BASE="https://github.com/phamminhkhoa2k4/tinyship/releases"
 
 CHECK_ONLY=0
 ASSUME_YES=0
