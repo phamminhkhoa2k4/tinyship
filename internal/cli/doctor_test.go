@@ -68,6 +68,9 @@ func doctorHealthy(t *testing.T) {
 
 	stubDockerAPI(t, "1.56", nil)
 	stubDoctor(t, &doctorLookPath, func(string) (string, error) { return "/usr/bin/found", nil })
+	stubDoctor(t, &doctorCaddyService, func(context.Context) (string, string, error) {
+		return "loaded", "active", nil
+	})
 	stubDoctor(t, &doctorCaddyAdmin, func(context.Context, string) error { return nil })
 	stubDoctor(t, &doctorStatfs, func(string) (uint64, error) { return 20000, nil })
 	stubSystemctl(t, "active", nil)
@@ -143,6 +146,58 @@ func TestDoctorAllPassExitsZero(t *testing.T) {
 		if chk.Name == "" || chk.Detail == "" {
 			t.Errorf("check with empty name or detail: %+v", chk)
 		}
+	}
+}
+
+func TestCheckProxyWarnsWhenCaddyUnitIsMissing(t *testing.T) {
+	stubDoctor(t, &doctorLookPath, func(string) (string, error) { return "/usr/bin/found", nil })
+	stubDoctor(t, &doctorCaddyService, func(context.Context) (string, string, error) {
+		return "not-found", "inactive", nil
+	})
+
+	checks := checkProxy(context.Background(), "")
+	if len(checks) != 1 {
+		t.Fatalf("checks = %+v, want one warning", checks)
+	}
+	if checks[0].Status != doctorWarn ||
+		!strings.Contains(checks[0].Detail, "caddy.service not found") ||
+		!strings.Contains(checks[0].Hint, "install Caddy as a systemd service") {
+		t.Fatalf("check = %+v, want a missing-unit warning with the install hint", checks[0])
+	}
+}
+
+func TestCheckProxyWarnsWhenCaddyUnitIsInactive(t *testing.T) {
+	stubDoctor(t, &doctorLookPath, func(string) (string, error) { return "/usr/bin/found", nil })
+	stubDoctor(t, &doctorCaddyService, func(context.Context) (string, string, error) {
+		return "loaded", "inactive", nil
+	})
+
+	checks := checkProxy(context.Background(), "")
+	if len(checks) != 1 {
+		t.Fatalf("checks = %+v, want one warning", checks)
+	}
+	if checks[0].Status != doctorWarn ||
+		!strings.Contains(checks[0].Detail, "inactive") ||
+		!strings.Contains(checks[0].Hint, "systemctl start caddy") {
+		t.Fatalf("check = %+v, want an inactive-unit warning with the start hint", checks[0])
+	}
+}
+
+func TestCheckProxySkipsHostUnitCheckUnderInstallRoot(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "admin.sock")
+	if err := os.WriteFile(sock, nil, 0o600); err != nil {
+		t.Fatalf("socket file: %v", err)
+	}
+	t.Setenv("TINYSHIP_CADDY_ADMIN", sock)
+	stubDoctor(t, &doctorLookPath, func(string) (string, error) { return "/usr/bin/found", nil })
+	stubDoctor(t, &doctorCaddyService, func(context.Context) (string, string, error) {
+		return "not-found", "inactive", nil
+	})
+	stubDoctor(t, &doctorCaddyAdmin, func(context.Context, string) error { return nil })
+
+	checks := checkProxy(context.Background(), t.TempDir())
+	if len(checks) != 1 || checks[0].Status != doctorPass {
+		t.Fatalf("checks = %+v, want one passing proxy check", checks)
 	}
 }
 

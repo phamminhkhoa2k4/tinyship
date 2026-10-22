@@ -44,6 +44,35 @@ resolve_caddy() {
     fi
 }
 
+# caddy_service_state reports the systemd load state for caddy.service.
+# A binary alone is not a working proxy: the service owns its runtime
+# directory and starts the process, while the installer only adds a
+# drop-in. Sandbox installs have no systemd, so look for the unit file
+# under the install root instead.
+caddy_service_state() {
+    if sandbox; then
+        local unit
+        for unit in \
+            "$INSTALL_ROOT/etc/systemd/system/caddy.service" \
+            "$INSTALL_ROOT/lib/systemd/system/caddy.service" \
+            "$INSTALL_ROOT/usr/lib/systemd/system/caddy.service"; do
+            if [[ -e "$unit" ]]; then
+                printf 'loaded\n'
+                return 0
+            fi
+        done
+        printf 'not-found\n'
+        return 0
+    fi
+    if ! command -v systemctl >/dev/null 2>&1; then
+        printf 'systemctl-unavailable\n'
+        return 0
+    fi
+    local state
+    state=$(systemctl show -p LoadState --value caddy.service 2>/dev/null || true)
+    printf '%s\n' "${state:-unknown}"
+}
+
 usage() {
     cat <<'EOF'
 Usage: install.sh [options]
@@ -169,13 +198,29 @@ preflight() {
         fi
     fi
 
- # 6. Caddy (the proxy that serves domains over HTTPS)
+ # 6. Caddy (the proxy that serves domains over HTTPS). A binary by
+ # itself cannot serve traffic: without a systemd unit there is no
+ # process, no runtime directory, and the drop-in has nothing to attach
+ # to. Fail when the two disagree instead of reporting a proxy that is
+ # not there.
     local caddy_bin
     caddy_bin=$(resolve_caddy)
     if [[ -z "$caddy_bin" ]]; then
         warn "Caddy is not installed; the installer will skip the proxy wiring (deploys work, domains cannot route)"
     else
         log "preflight: Caddy $("$caddy_bin" version 2>/dev/null | awk '{print $1}') available"
+        local caddy_state
+        caddy_state=$(caddy_service_state)
+        case "$caddy_state" in
+            loaded)
+                log "preflight: caddy.service available" ;;
+            not-found)
+                fail "Caddy binary found but caddy.service is not installed; install Caddy as a systemd service, then re-run (domains cannot route without it)"
+                ok=1 ;;
+            *)
+                fail "caddy.service is not usable (state: ${caddy_state}); repair or reinstall Caddy, then re-run"
+                ok=1 ;;
+        esac
     fi
 
     return "$ok"
@@ -264,6 +309,12 @@ ensure_docker() {
 write_caddy_baseline() {
     local path="$INSTALL_ROOT/etc/caddy/caddy.json"
     if [[ -e "$path" ]]; then
+        # A previous install may predate the caddy account (or the
+        # package may have created it since). Keep the content, but make
+        # sure the proxy user can still read it.
+        if ! sandbox && getent group caddy >/dev/null 2>&1; then
+            chown root:caddy "$path"
+        fi
         log "existing $path kept (idempotent install)"
         return 0
     fi
@@ -284,20 +335,39 @@ EOF
 # write_caddy_unit installs the systemd drop-ins that point Caddy at
 # the TinyShip baseline. The service group makes the admin socket group
 # caddy-admin, which tinyship-worker joins; RuntimeDirectory creates
-# /run/caddy. The OOM score keeps the proxy below app containers when
-# the kernel has to choose a victim. The main drop-in is never
-# overwritten; the small OOM drop-in is added even when the main file
-# already exists, so an upgraded host gets the ordering too.
+# /run/caddy. When the package's caddy group exists, the process keeps it
+# as a supplementary group so it can still read a root:caddy config.
+# The OOM score keeps the proxy below app containers when the kernel has
+# to choose a victim. The main drop-in is never overwritten, but a
+# missing supplementary-group line is added on an upgraded host; the
+# small OOM drop-in is also added when the main file already exists.
 write_caddy_unit() {
-    local caddy_bin dropin oom_dropin
+    local caddy_bin caddy_state caddy_group dropin oom_dropin
     caddy_bin=$(resolve_caddy)
+    caddy_state=$(caddy_service_state)
+    caddy_group=""
+    if getent group caddy >/dev/null 2>&1; then
+        caddy_group="SupplementaryGroups=caddy"
+    fi
     dropin="$INSTALL_ROOT/etc/systemd/system/caddy.service.d/tinyship.conf"
     oom_dropin="$(dirname "$dropin")/tinyship-oom.conf"
     if [[ -z "$caddy_bin" ]]; then
         warn "Caddy binary not found; skipping Caddy drop-ins (install Caddy, then re-run the installer)"
         return 0
     fi
+    if [[ "$caddy_state" != "loaded" ]]; then
+        if [[ "$caddy_state" == "not-found" ]]; then
+            warn "caddy.service not found; skipping Caddy drop-ins (install Caddy as a systemd service, then re-run)"
+        else
+            warn "caddy.service is not usable (state: ${caddy_state}); skipping Caddy drop-ins"
+        fi
+        return 0
+    fi
     if [[ -e "$dropin" ]]; then
+        if [[ -n "$caddy_group" ]] && ! grep -qxF "$caddy_group" "$dropin"; then
+            printf '\n%s\n' "$caddy_group" >>"$dropin"
+            log "added $caddy_group to $dropin"
+        fi
         log "existing $dropin kept (idempotent install)"
     else
         install -d -m 0755 "$(dirname "$dropin")"
@@ -306,6 +376,7 @@ write_caddy_unit() {
 Group=caddy-admin
 RuntimeDirectory=caddy
 RuntimeDirectoryMode=0755
+$caddy_group
 ExecStart=
 ExecStart=$caddy_bin run --config /etc/caddy/caddy.json
 EOF
@@ -702,12 +773,20 @@ start_services() {
         return 1
     fi
     log "both services active"
-    # The proxy is managed by the operator: reload it only if it is
-    # already running so the drop-in takes effect without forcing a
-    # start the operator did not ask for.
-    if [[ -n "$(resolve_caddy)" ]] && systemctl is-active --quiet caddy; then
-        systemctl try-restart caddy \
-            || warn "caddy is running but could not be restarted; run: systemctl restart caddy"
+    # Caddy is supplied by the operator or its package, but the drop-in
+    # and baseline only take effect after the unit starts. Reload an
+    # already-running proxy; start and enable an installed but stopped
+    # one. A failed start is reported rather than hidden.
+    if [[ -n "$(resolve_caddy)" ]] && [[ "$(caddy_service_state)" == "loaded" ]]; then
+        if systemctl is-active --quiet caddy; then
+            log "reloading caddy.service"
+            systemctl try-restart caddy \
+                || warn "caddy is running but could not be restarted; run: systemctl restart caddy"
+        else
+            log "starting caddy.service (installed but stopped)"
+            systemctl enable --now caddy \
+                || warn "caddy.service could not be started; run: systemctl start caddy (logs: journalctl -u caddy -n 50)"
+        fi
     fi
 }
 

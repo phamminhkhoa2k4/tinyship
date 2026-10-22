@@ -44,6 +44,29 @@ var (
 		_, _, err := caddy.NewClient(socket).CurrentConfig(ctx)
 		return err
 	}
+	// doctorCaddyService reports the systemd load and active states for
+	// the proxy unit. A binary without a unit can never be started by
+	// the installer or by a reboot.
+	doctorCaddyService = func(ctx context.Context) (loadState, activeState string, err error) {
+		out, err := doctorSystemctl(ctx, "show",
+			"--property=LoadState", "--property=ActiveState", "caddy.service")
+		if err != nil {
+			return "", "", err
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			key, value, ok := strings.Cut(line, "=")
+			if !ok {
+				continue
+			}
+			switch key {
+			case "LoadState":
+				loadState = strings.TrimSpace(value)
+			case "ActiveState":
+				activeState = strings.TrimSpace(value)
+			}
+		}
+		return loadState, activeState, nil
+	}
 )
 
 const (
@@ -99,7 +122,7 @@ on the host is changed. Exits non-zero when any check fails.
 
 	checks := []doctorCheck{}
 	checks = append(checks, checkDocker(ctx)...)
-	checks = append(checks, checkProxy(ctx)...)
+	checks = append(checks, checkProxy(ctx, root)...)
 	checks = append(checks, checkFiles(root)...)
 	checks = append(checks, checkDisk(ctx, root)...)
 	checks = append(checks, checkServices(ctx)...)
@@ -177,11 +200,13 @@ func checkDocker(ctx context.Context) []doctorCheck {
 	}}
 }
 
-// checkProxy proves the proxy binary exists and its admin socket
-// answers. A missing socket only warns: hosts that run without
-// declared domains do not need the proxy up. A socket that exists but
-// refuses to answer is a broken installed state and fails.
-func checkProxy(ctx context.Context) []doctorCheck {
+// checkProxy proves the proxy binary exists, its systemd unit is
+// startable, and its admin socket answers. A missing unit or a stopped
+// service only warns: hosts that run without declared domains do not
+// need the proxy up. A socket that exists but refuses to answer is a
+// broken installed state and fails. Sandbox roots do not own host units,
+// so they skip the unit-state check.
+func checkProxy(ctx context.Context, root string) []doctorCheck {
 	if _, err := doctorLookPath("caddy"); err != nil {
 		return []doctorCheck{{
 			Name:   "caddy",
@@ -189,6 +214,39 @@ func checkProxy(ctx context.Context) []doctorCheck {
 			Detail: "caddy binary not found",
 			Hint:   "install Caddy 2: without it declared domains cannot be routed",
 		}}
+	}
+	if root == "" {
+		if _, err := doctorLookPath("systemctl"); err == nil {
+			loadState, activeState, err := doctorCaddyService(ctx)
+			if err == nil {
+				switch {
+				case loadState == "":
+					// Unknown systemd output; the socket check below
+					// still gives a useful verdict.
+				case loadState == "not-found":
+					return []doctorCheck{{
+						Name:   "caddy",
+						Status: doctorWarn,
+						Detail: "caddy.service not found (a binary alone cannot route declared domains)",
+						Hint:   "install Caddy as a systemd service, then re-run the installer",
+					}}
+				case loadState != "loaded":
+					return []doctorCheck{{
+						Name:   "caddy",
+						Status: doctorWarn,
+						Detail: fmt.Sprintf("caddy.service is %s; the proxy cannot start", loadState),
+						Hint:   "repair or reinstall Caddy, then start caddy.service",
+					}}
+				case activeState != "" && activeState != "active":
+					return []doctorCheck{{
+						Name:   "caddy",
+						Status: doctorWarn,
+						Detail: fmt.Sprintf("caddy.service is %s (proxy not running)", activeState),
+						Hint:   "start the proxy: systemctl start caddy",
+					}}
+				}
+			}
+		}
 	}
 	socket := os.Getenv("TINYSHIP_CADDY_ADMIN")
 	if socket == "" {
