@@ -21,9 +21,20 @@ import (
 // like the production client does after verification.
 type fakeCaddy struct {
 	mu      sync.Mutex
+	current map[string]any
 	applies []map[string]any
 	hashes  []string
 	err     error
+	readErr error
+}
+
+func (f *fakeCaddy) CurrentConfig(_ context.Context) (map[string]any, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.readErr != nil {
+		return nil, "", f.readErr
+	}
+	return f.current, "", nil
 }
 
 func (f *fakeCaddy) ApplyServer(_ context.Context, server map[string]any) (string, error) {
@@ -38,7 +49,17 @@ func (f *fakeCaddy) ApplyServer(_ context.Context, server map[string]any) (strin
 	}
 	f.applies = append(f.applies, server)
 	f.hashes = append(f.hashes, h)
+	f.current = server
 	return h, nil
+}
+
+// forgetCurrent models a proxy restart that came back with only its
+// baseline config, which is how a service or host restart loses routes
+// that were applied through the admin API.
+func (f *fakeCaddy) forgetCurrent() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.current = nil
 }
 
 func (f *fakeCaddy) last() map[string]any {
@@ -315,6 +336,34 @@ func TestRegenerateRoutesAppliesWhenHashDiffers(t *testing.T) {
 	}
 	if body := routeBody(t, fc.last()); !strings.Contains(body, "127.0.0.1:20099") {
 		t.Errorf("regenerated config misses new port: %s", body)
+	}
+}
+
+func TestRegenerateRoutesRestoresLostLiveConfig(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	fc := &fakeCaddy{}
+	log := slog.New(slog.DiscardHandler)
+
+	createRoutedApp(t, s, "web", "web.example.com", 20017)
+	if err := RegenerateRoutes(ctx, s, fc, log); err != nil {
+		t.Fatalf("initial regenerate: %v", err)
+	}
+	if fc.count() != 1 {
+		t.Fatalf("initial applies = %d, want 1", fc.count())
+	}
+
+	// The recorded hash still matches the database, but the proxy came
+	// back from a restart with only its baseline config.
+	fc.forgetCurrent()
+	if err := RegenerateRoutes(ctx, s, fc, log); err != nil {
+		t.Fatalf("regenerate after losing live config: %v", err)
+	}
+	if fc.count() != 2 {
+		t.Fatalf("applies after losing live config = %d, want 2", fc.count())
+	}
+	if body := routeBody(t, fc.last()); !strings.Contains(body, "web.example.com") {
+		t.Errorf("restored config misses hostname: %s", body)
 	}
 }
 

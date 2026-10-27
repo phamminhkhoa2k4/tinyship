@@ -24,6 +24,7 @@ const CaddyConfigHashKey = "caddy_config_hash"
 // production implementation is *caddy.Client over the admin socket;
 // tests inject a fake.
 type Caddy interface {
+	CurrentConfig(ctx context.Context) (map[string]any, string, error)
 	ApplyServer(ctx context.Context, server map[string]any) (string, error)
 }
 
@@ -85,11 +86,14 @@ func DefaultProbe(ctx context.Context, hostname string) (int, error) {
 }
 
 // RegenerateRoutes rebuilds the proxy config from the database and
-// applies it when the recorded hash differs. This is crash recovery in
-// one function: after any restart the routes converge to the last
-// succeeded deployments, no matter where the previous process died.
-// A host that never routed anything and has no active domains is a
-// no-op, so fresh installs do not touch the proxy baseline.
+// applies it when the live proxy differs from both the database and the
+// recorded hash. This is crash recovery in one function: after any
+// restart the routes converge to the last succeeded deployments, no
+// matter where the previous process died. The live check matters because
+// the proxy starts from its baseline file and does not persist API
+// updates across a service or host restart. A host that never routed
+// anything and has no active domains is a no-op, so fresh installs do
+// not touch the proxy baseline.
 func RegenerateRoutes(ctx context.Context, s *store.Store, cc Caddy, log *slog.Logger) error {
 	rows, err := s.ListRouteRows(ctx)
 	if err != nil {
@@ -111,8 +115,19 @@ func RegenerateRoutes(ctx context.Context, s *store.Store, cc Caddy, log *slog.L
 		return err
 	}
 	if applied == hash {
-		log.Debug("worker: routes already current", "hash", hash)
-		return nil
+		live, _, err := cc.CurrentConfig(ctx)
+		if err == nil {
+			liveHash, hashErr := caddy.Hash(live)
+			if hashErr == nil && liveHash == hash {
+				log.Debug("worker: routes already current", "hash", hash)
+				return nil
+			}
+			log.Info("worker: live proxy config differs; reapplying routes",
+				"want", hash, "live", liveHash)
+		} else {
+			log.Info("worker: could not read live proxy config; reapplying routes",
+				"err", err)
+		}
 	}
 	got, err := cc.ApplyServer(ctx, server)
 	if err != nil {
