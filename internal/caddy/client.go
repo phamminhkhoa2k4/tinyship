@@ -24,6 +24,11 @@ const maxApplyAttempts = 3
 // TINYSHIP_CADDY_ADMIN overrides it for development and tests.
 const DefaultSocket = "/run/caddy/admin.sock"
 
+// adminHost is the Host header used on the unix socket. The installer
+// allows it in the admin origins list because Caddy 2.6 rejects an
+// admin request whose Host is not explicitly allowed.
+const adminHost = "caddy"
+
 // Client talks to the Caddy admin API over its Unix socket. It can
 // read the current server config, replace it atomically with Etag
 // concurrency control, and report the applied config's hash.
@@ -53,7 +58,7 @@ func NewClient(path string) *Client {
 // subtree returns (nil, "") so callers can treat first apply as a create.
 func (c *Client) CurrentConfig(ctx context.Context) (map[string]any, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		"http://caddy"+ServerPath, nil)
+		"http://"+adminHost+ServerPath, nil)
 	if err != nil {
 		return nil, "", err
 	}
@@ -76,7 +81,14 @@ func (c *Client) CurrentConfig(ctx context.Context) (map[string]any, string, err
 	if err := json.Unmarshal(body, &cfg); err != nil {
 		return nil, "", fmt.Errorf("caddy: decode current config: %w", err)
 	}
-	return cfg, resp.Header.Get("Etag"), nil
+	// Caddy 2.6 sends the ETag as an HTTP trailer, so it is populated
+	// only after the body has been consumed. Newer versions send it as
+	// a normal header; accept either location.
+	etag := resp.Header.Get("Etag")
+	if etag == "" {
+		etag = resp.Trailer.Get("Etag")
+	}
+	return cfg, etag, nil
 }
 
 // ApplyServer atomically replaces the server subtree with the generated
@@ -152,7 +164,7 @@ func (e *UnreachableError) Unwrap() error { return e.Err }
 // optimistic concurrency (absent Etag means unconditional replace).
 func (c *Client) replaceServer(ctx context.Context, etag string, body []byte) (int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		"http://caddy"+ServerPath, bytes.NewReader(body))
+		"http://"+adminHost+ServerPath, bytes.NewReader(body))
 	if err != nil {
 		return 0, err
 	}

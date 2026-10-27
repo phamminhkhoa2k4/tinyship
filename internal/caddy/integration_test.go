@@ -55,7 +55,8 @@ func startCaddy(t *testing.T, bin string) string {
 	sock := filepath.Join(dir, "admin.sock")
 	cfg := filepath.Join(dir, "caddy.json")
 	base := fmt.Sprintf(
-		`{"admin":{"listen":"unix/%s|0660"},"apps":{"http":{"servers":{}}}}`, sock)
+		`{"admin":{"listen":"unix/%s","origins":["%s"]},"apps":{"http":{"servers":{}}}}`,
+		sock, adminHost)
 	if err := os.WriteFile(cfg, []byte(base), 0o600); err != nil {
 		t.Fatalf("write caddy config: %v", err)
 	}

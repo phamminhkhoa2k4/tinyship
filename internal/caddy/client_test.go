@@ -241,6 +241,26 @@ func TestCurrentConfigMissingSubtree(t *testing.T) {
 	}
 }
 
+func TestCurrentConfigReadsETagTrailer(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Trailer", "Etag")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"listen":[":443"]}`))
+		w.Header().Set("Etag", `"trailer-tag"`)
+	})
+	c, done := startFake(t, handler)
+	defer done()
+
+	cfg, etag, err := c.CurrentConfig(context.Background())
+	if err != nil || cfg == nil {
+		t.Fatalf("CurrentConfig = %v, %q, %v", cfg, etag, err)
+	}
+	if etag != `"trailer-tag"` {
+		t.Errorf("etag = %q, want the trailer value", etag)
+	}
+}
+
 func TestApplyServerRejectsBadStatus(t *testing.T) {
 	f := &fakeAdmin{failPost: true}
 	c, done := startFake(t, f.handler())
