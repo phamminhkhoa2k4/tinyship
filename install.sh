@@ -169,8 +169,10 @@ preflight() {
         [[ -n "$(resolve_caddy)" ]] && caddy_here=1
         for port in 80 443; do
             if listening_on "$port"; then
-                if (( caddy_here )); then
-                    fail "port ${port} is already in use; Caddy cannot start (stop the service using it or reassign it)"
+                if (( caddy_here )) && caddy_owns_port "$port"; then
+                    log "preflight: port ${port} held by caddy.service (will be reconfigured)"
+                elif (( caddy_here )); then
+                    fail "port ${port} is already in use by another service; stop it or reassign it"
                     ok=1
                 else
                     warn "port ${port} is in use; no proxy runs in this install (Caddy absent), this only blocks a later Caddy setup"
@@ -236,6 +238,22 @@ listening_on() {
         hex=$(printf '%04X' "$port")
         grep -qE "^[[:space:]]*[0-9]+: [0-9A-F]{8,32}:${hex} " /proc/net/tcp /proc/net/tcp6 2>/dev/null
     fi
+}
+
+# caddy_owns_port reports whether caddy.service's main process owns the
+# listening socket. A distribution Caddy package commonly starts with a
+# default Caddyfile on :80 before TinyShip writes its baseline; that is
+# the expected proxy listener, not a port conflict. Non-root preflight
+# cannot see another user's socket owner, so it keeps the conservative
+# conflict result.
+caddy_owns_port() {
+    local port=$1 caddy_pid listener_pids
+    command -v ss >/dev/null 2>&1 || return 1
+    caddy_pid=$(systemctl show -p MainPID --value caddy.service 2>/dev/null || true)
+    [[ -n "$caddy_pid" && "$caddy_pid" != "0" ]] || return 1
+    listener_pids=$(ss -ltnp "sport = :${port}" 2>/dev/null \
+        | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u || true)
+    grep -qx "$caddy_pid" <<<"$listener_pids"
 }
 
 # confirm asks a yes/no question. --yes answers yes so non-interactive
@@ -305,10 +323,28 @@ ensure_docker() {
 # write_caddy_baseline installs the base proxy config: admin over the
 # unix socket, automatic HTTPS at Caddy's default (enabled), and an
 # empty tinyship server that the worker replaces wholesale at deploy
-# time. An existing file is never overwritten.
+# time. The admin address has no permission suffix because Caddy 2.6
+# treats that suffix as part of the socket path; the unit's
+# ExecStartPost applies mode 0660 instead. The origins list admits the
+# "caddy" Host used by the admin client on Caddy 2.6, whose admin
+# endpoint checks Host. Existing content is kept, except the known old
+# admin value is upgraded in place.
 write_caddy_baseline() {
     local path="$INSTALL_ROOT/etc/caddy/caddy.json"
     if [[ -e "$path" ]]; then
+        # A previous install may have the old socket-filename suffix, or
+        # may predate the admin origin added for Caddy 2.6. Rewrite only
+        # the exact admin value so the rest of the file stays untouched.
+        if grep -qF 'unix//run/caddy/admin.sock|0660' "$path"; then
+            sed -i 's#unix//run/caddy/admin.sock|0660#unix//run/caddy/admin.sock#g' "$path"
+            log "removed the Caddy 2.6 admin socket suffix from $path"
+        fi
+        if grep -qF 'unix//run/caddy/admin.sock' "$path" \
+            && ! grep -qF '"origins"' "$path"; then
+            sed -i 's#"listen": "unix//run/caddy/admin.sock"#"listen": "unix//run/caddy/admin.sock", "origins": ["caddy", "localhost", "127.0.0.1"]#' "$path"
+            log "added the admin socket origins to $path"
+        fi
+        chmod 0640 "$path"
         # A previous install may predate the caddy account (or the
         # package may have created it since). Keep the content, but make
         # sure the proxy user can still read it.
@@ -321,7 +357,7 @@ write_caddy_baseline() {
     install -d -m 0755 "$(dirname "$path")"
     cat >"$path" <<'EOF'
 {
-  "admin": {"listen": "unix//run/caddy/admin.sock|0660"},
+  "admin": {"listen": "unix//run/caddy/admin.sock", "origins": ["caddy", "localhost", "127.0.0.1"]},
   "apps": {"http": {"servers": {"tinyship": {}}}}
 }
 EOF
@@ -335,11 +371,13 @@ EOF
 # write_caddy_unit installs the systemd drop-ins that point Caddy at
 # the TinyShip baseline. The service group makes the admin socket group
 # caddy-admin, which tinyship-worker joins; RuntimeDirectory creates
-# /run/caddy. When the package's caddy group exists, the process keeps it
-# as a supplementary group so it can still read a root:caddy config.
-# The OOM score keeps the proxy below app containers when the kernel has
-# to choose a victim. The main drop-in is never overwritten, but a
-# missing supplementary-group line is added on an upgraded host; the
+# /run/caddy. ExecStartPost sets the socket mode after Caddy has opened
+# it, which works on Caddy 2.6 where a listen-address permission suffix
+# is not supported. When the package's caddy group exists, the process
+# keeps it as a supplementary group so it can still read a root:caddy
+# config. The OOM score keeps the proxy below app containers when the
+# kernel has to choose a victim. The main drop-in is never overwritten,
+# but missing compatibility lines are added on an upgraded host; the
 # small OOM drop-in is also added when the main file already exists.
 write_caddy_unit() {
     local caddy_bin caddy_state caddy_group dropin oom_dropin
@@ -368,6 +406,10 @@ write_caddy_unit() {
             printf '\n%s\n' "$caddy_group" >>"$dropin"
             log "added $caddy_group to $dropin"
         fi
+        if ! grep -qF 'ExecStartPost=-/bin/chmod 0660 /run/caddy/admin.sock' "$dropin"; then
+            printf '\n%s\n' 'ExecStartPost=-/bin/chmod 0660 /run/caddy/admin.sock' >>"$dropin"
+            log "added admin socket permissions to $dropin"
+        fi
         log "existing $dropin kept (idempotent install)"
     else
         install -d -m 0755 "$(dirname "$dropin")"
@@ -379,6 +421,7 @@ RuntimeDirectoryMode=0755
 $caddy_group
 ExecStart=
 ExecStart=$caddy_bin run --config /etc/caddy/caddy.json
+ExecStartPost=-/bin/chmod 0660 /run/caddy/admin.sock
 EOF
         chmod 0644 "$dropin"
         log "installed $dropin (reload with: systemctl daemon-reload && systemctl restart caddy)"
