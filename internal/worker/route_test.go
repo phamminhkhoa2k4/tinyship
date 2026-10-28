@@ -288,6 +288,42 @@ func TestDefaultProbeSwitchesToTLSWithAURL(t *testing.T) {
 	}
 }
 
+func TestDefaultProbeFollowsRedirectWithoutTrustStore(t *testing.T) {
+	// A proxy with automatic HTTPS answers a plain probe with a redirect
+	// to https, and the target may present a locally issued certificate
+	// (a hostname whose DNS still points elsewhere). The followed
+	// request must still prove routing: trust-store contents must not
+	// decide a deploy, while the handshake keeps carrying the route's
+	// hostname as SNI.
+	var seenSNI string
+	tlsSrv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	tlsSrv.TLS = &tls.Config{GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+		seenSNI = chi.ServerName
+		return nil, nil
+	}}
+	tlsSrv.StartTLS()
+	defer tlsSrv.Close()
+
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, tlsSrv.URL+"/", http.StatusPermanentRedirect)
+	}))
+	defer plain.Close()
+
+	t.Setenv("TINYSHIP_CADDY_PROBE", plain.URL)
+	got, err := DefaultProbe(context.Background(), "app.example.test")
+	if err != nil {
+		t.Fatalf("probe after http->https redirect: %v", err)
+	}
+	if got != http.StatusOK {
+		t.Errorf("status = %d, want 200 from the routed app", got)
+	}
+	if seenSNI != "app.example.test" {
+		t.Errorf("SNI = %q, want the routed hostname", seenSNI)
+	}
+}
+
 func TestRegenerateRoutesAppliesWhenHashDiffers(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)

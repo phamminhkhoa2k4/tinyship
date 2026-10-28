@@ -60,21 +60,22 @@ func DefaultProbe(ctx context.Context, hostname string) (int, error) {
 		return 0, err
 	}
 	req.Host = hostname
+	// This probe proves routing, not certificate identity: the
+	// loopback target presents whatever issuer the host configured,
+	// and trust-store contents must not decide whether a route switch
+	// counts as healthy. A proxy with automatic HTTPS answers a plain
+	// request with a redirect to https, and the followed request keeps
+	// the same trust model — a locally issued certificate must not
+	// fail a deploy that reached the app. The server name carries the
+	// hostname on every handshake because the proxy refuses handshakes
+	// whose SNI does not match a route, while the connection itself
+	// goes to the loopback proxy address.
 	client := &http.Client{Timeout: 10 * time.Second}
-	if scheme == "https" {
-		// This probe proves routing, not certificate identity: the
-		// loopback target presents whatever issuer the test host
-		// configured, and trust-store contents must not decide whether
-		// a route switch counts as healthy. The server name still
-		// carries the hostname because the proxy refuses handshakes
-		// whose SNI does not match a route, while the connection
-		// itself goes to the loopback proxy address.
-		client.Transport = &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true, //nolint:gosec // routing probe by design
-				ServerName:         hostname,
-			},
-		}
+	client.Transport = &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, //nolint:gosec // routing probe by design
+			ServerName:         hostname,
+		},
 	}
 	resp, err := client.Do(req)
 	if err != nil {
