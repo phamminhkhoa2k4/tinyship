@@ -586,7 +586,7 @@ install_binary() {
     fi
 
     log "install done; the admin token above was shown once — store it safely"
-    log "create your first app: tinyship app create --name web --image traefik/whoami --port 8080"
+    log "create your first app: tinyship app create --name web --image traefik/whoami --port 80"
 }
 
 # write_keys generates the sealed-secret key pair on first install. The
