@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,11 +29,19 @@ const DefaultAPIBase = "http://127.0.0.1:7878"
 // by the CLI's normal operators, not by other local users.
 const DefaultTokenFile = "/etc/tinyship/token"
 
+// ErrTokenUnreadable marks a token file that exists but cannot be read,
+// so callers report the local permission cause instead of blaming the
+// API for a request that never carried a credential.
+var ErrTokenUnreadable = errors.New("cannot read the admin token")
+
 type apiClient struct {
 	base string
 	// token is the bearer credential read from tokenPath; empty when the
-	// file is missing or unreadable (the API then rejects and guides).
-	token     string
+	// file is missing (the API then rejects and guides).
+	token string
+	// tokenErr is non-nil only when the file exists but cannot be read;
+	// requests then fail with that cause rather than an empty bearer.
+	tokenErr  error
 	tokenPath string
 	// regular bounds ordinary calls; streams (logs --follow, deploy
 	// --wait polls) use their own clients/contexts.
@@ -50,24 +59,31 @@ func newAPIClient() *apiClient {
 	if tokenPath == "" {
 		tokenPath = DefaultTokenFile
 	}
+	tok, terr := readTokenFile(tokenPath)
 	return &apiClient{
 		base:      base,
-		token:     readTokenFile(tokenPath),
+		token:     tok,
+		tokenErr:  terr,
 		tokenPath: tokenPath,
 		regular:   &http.Client{Timeout: 30 * time.Second},
 		stream:    &http.Client{},
 	}
 }
 
-// readTokenFile returns the trimmed token from path, or "" when the file
-// cannot be read (the 401 the API returns then tells the operator how to
-// re-issue a token).
-func readTokenFile(path string) string {
+// readTokenFile returns the trimmed token from path. A missing file is
+// not an error (the 401 the API returns then tells the operator how to
+// issue one); a file that exists but cannot be read — the installer's
+// admin group only reaches a fresh login — is returned as an error so
+// the real cause reaches the operator instead of a generic 401.
+func readTokenFile(path string) (string, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return ""
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
 	}
-	return strings.TrimSpace(string(b))
+	return strings.TrimSpace(string(b)), nil
 }
 
 // errEnvelope is the API's uniform error shape.
@@ -107,6 +123,18 @@ func (c *apiClient) newRequest(ctx context.Context, method, path string, body []
 	return req, nil
 }
 
+// unauthorizedCause returns the local token-read error when the API
+// rejected a request that carried no bearer because the token file is
+// unreadable: the operator needs the permission cause (a fresh login or
+// sudo), not a generic E_UNAUTHORIZED suggesting a rotation.
+func (c *apiClient) unauthorizedCause(resp *http.Response) error {
+	if resp.StatusCode == http.StatusUnauthorized && c.tokenErr != nil {
+		return fmt.Errorf("%w: %v — log out and back in once after install, or run this command with sudo",
+			ErrTokenUnreadable, c.tokenErr)
+	}
+	return nil
+}
+
 // do performs a bounded request and returns the response; callers must
 // close the body. Non-2xx responses are returned as-is for apiError.
 func (c *apiClient) do(ctx context.Context, method, path string, body []byte) (*http.Response, error) {
@@ -114,7 +142,15 @@ func (c *apiClient) do(ctx context.Context, method, path string, body []byte) (*
 	if err != nil {
 		return nil, err
 	}
-	return c.regular.Do(req)
+	resp, err := c.regular.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if cause := c.unauthorizedCause(resp); cause != nil {
+		resp.Body.Close()
+		return nil, cause
+	}
+	return resp, nil
 }
 
 // doJSON performs a request and decodes a 2xx JSON body into out.

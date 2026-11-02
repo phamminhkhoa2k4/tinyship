@@ -603,6 +603,10 @@ the worker enforces container ownership before streaming.
 		return 1
 	}
 	defer resp.Body.Close()
+	if cause := c.unauthorizedCause(resp); cause != nil {
+		fmt.Fprintf(stderr, "tinyship logs: %v\n", cause)
+		return 1
+	}
 	if resp.StatusCode != http.StatusOK {
 		fmt.Fprintf(stderr, "tinyship logs: %v\n", apiError(resp))
 		return 1
@@ -695,6 +699,10 @@ func cmdStatus(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		TCPListen string `json:"tcp_listen"`
 	}
 	if err := c.doJSON(ctx, http.MethodGet, "/healthz", nil, &health); err != nil {
+		if errors.Is(err, ErrTokenUnreadable) {
+			fmt.Fprintf(stderr, "tinyship status: %v\n", err)
+			return 1
+		}
 		fmt.Fprintf(stderr, "tinyship status: API unreachable at %s (is `tinyship api` running?): %v\n",
 			c.base, err)
 		return 1
