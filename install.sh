@@ -585,7 +585,7 @@ install_binary() {
         warn "anyone with the admin token can control this host; firewall the port or keep the loopback default unless you need remote access"
     fi
 
-    log "install done; the admin token above was shown once — store it safely"
+    log "install done; the admin token is in ${INSTALL_ROOT}/etc/tinyship/token (read it with 'sudo cat'; the CLI uses it after your next login)"
     log "create your first app: tinyship app create --name web --image traefik/whoami --port 80"
 }
 
@@ -856,7 +856,7 @@ bootstrap_token() {
         return 0
     fi
 
-    log "issuing the first admin token (hash stored; plaintext written to $tf and shown once)"
+    log "issuing the first admin token (hash stored; plaintext written to $tf)"
     if ! TINYSHIP_DB="$db" TINYSHIP_TOKEN_FILE="$tf" "$bin" token create >/dev/null 2>"$INSTALL_ROOT/token.err"; then
         cat "$INSTALL_ROOT/token.err" >&2
         rm -f "$INSTALL_ROOT/token.err"
