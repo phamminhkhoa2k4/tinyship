@@ -201,6 +201,47 @@ func TestCheckProxySkipsHostUnitCheckUnderInstallRoot(t *testing.T) {
 	}
 }
 
+func TestCheckProxyFailsWhenAdminSocketHidesTheWorker(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "admin.sock")
+	if err := os.WriteFile(sock, nil, 0o200); err != nil {
+		t.Fatalf("socket file: %v", err)
+	}
+	t.Setenv("TINYSHIP_CADDY_ADMIN", sock)
+	stubDoctor(t, &doctorLookPath, func(string) (string, error) { return "/usr/bin/found", nil })
+	stubDoctor(t, &doctorCaddyService, func(context.Context) (string, string, error) {
+		return "loaded", "active", nil
+	})
+	// Root would dial this socket successfully; the mode must still fail.
+	stubDoctor(t, &doctorCaddyAdmin, func(context.Context, string) error { return nil })
+
+	checks := checkProxy(context.Background(), "")
+	if len(checks) != 1 || checks[0].Status != doctorFail {
+		t.Fatalf("checks = %+v, want one failing proxy check", checks)
+	}
+	if !strings.Contains(checks[0].Detail, "0200") ||
+		!strings.Contains(checks[0].Hint, "systemctl restart caddy") {
+		t.Errorf("check = %+v, want the socket mode in the detail and a restart fix", checks[0])
+	}
+}
+
+func TestCheckProxyPassesWhenAdminSocketAdmitsTheWorker(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "admin.sock")
+	if err := os.WriteFile(sock, nil, 0o660); err != nil {
+		t.Fatalf("socket file: %v", err)
+	}
+	t.Setenv("TINYSHIP_CADDY_ADMIN", sock)
+	stubDoctor(t, &doctorLookPath, func(string) (string, error) { return "/usr/bin/found", nil })
+	stubDoctor(t, &doctorCaddyService, func(context.Context) (string, string, error) {
+		return "loaded", "active", nil
+	})
+	stubDoctor(t, &doctorCaddyAdmin, func(context.Context, string) error { return nil })
+
+	checks := checkProxy(context.Background(), "")
+	if len(checks) != 1 || checks[0].Status != doctorPass {
+		t.Fatalf("checks = %+v, want one passing proxy check", checks)
+	}
+}
+
 func TestDoctorWarnsBetweenDeployFloorAndInstallerMinimum(t *testing.T) {
 	doctorHealthy(t)
 	stubDoctor(t, &doctorStatfs, func(string) (uint64, error) { return 4000, nil })

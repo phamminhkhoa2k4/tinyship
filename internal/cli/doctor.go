@@ -204,8 +204,9 @@ func checkDocker(ctx context.Context) []doctorCheck {
 // startable, and its admin socket answers. A missing unit or a stopped
 // service only warns: hosts that run without declared domains do not
 // need the proxy up. A socket that exists but refuses to answer is a
-// broken installed state and fails. Sandbox roots do not own host units,
-// so they skip the unit-state check.
+// broken installed state and fails, as is a socket whose mode hides it
+// from the worker. Sandbox roots do not own host units or a running
+// worker, so they skip the unit-state and socket-mode checks.
 func checkProxy(ctx context.Context, root string) []doctorCheck {
 	if _, err := doctorLookPath("caddy"); err != nil {
 		return []doctorCheck{{
@@ -252,12 +253,26 @@ func checkProxy(ctx context.Context, root string) []doctorCheck {
 	if socket == "" {
 		socket = caddy.DefaultSocket
 	}
-	if _, err := os.Lstat(socket); err != nil {
+	st, err := os.Lstat(socket)
+	if err != nil {
 		return []doctorCheck{{
 			Name:   "caddy",
 			Status: doctorWarn,
 			Detail: "admin socket " + socket + " is missing (proxy not running)",
 			Hint:   "start the proxy: systemctl start caddy",
+		}}
+	}
+	// The worker reaches this socket as a different user, so the mode
+	// must admit the caddy-admin group. Root can dial a socket with no
+	// group or other bits anyway, which is exactly the blind spot this
+	// closes; a sandbox root has no worker to serve.
+	if root == "" && st.Mode().Perm()&0o022 == 0 {
+		return []doctorCheck{{
+			Name:   "caddy",
+			Status: doctorFail,
+			Detail: fmt.Sprintf("admin socket %s has mode %04o: the worker cannot connect to it",
+				socket, st.Mode().Perm()),
+			Hint: "re-run the installer, then restart the proxy: systemctl restart caddy",
 		}}
 	}
 	if err := doctorCaddyAdmin(ctx, socket); err != nil {
