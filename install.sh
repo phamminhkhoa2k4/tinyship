@@ -44,6 +44,23 @@ resolve_caddy() {
     fi
 }
 
+# caddy_supports_socket_mode reports whether the installed Caddy honours
+# the permission suffix on a unix listen address. Caddy 2.7 added it;
+# 2.6 and older read the suffixed value as part of the socket filename,
+# so only those get the bare path and rely on the unit's ExecStartPost
+# to set the mode. A version that cannot be read is assumed modern.
+caddy_supports_socket_mode() {
+    local bin ver major minor
+    bin=$(resolve_caddy)
+    [[ -n "$bin" ]] || return 1
+    ver=$("$bin" version 2>/dev/null | awk '{print $1}')
+    ver=${ver#v}
+    [[ "$ver" =~ ^([0-9]+)\.([0-9]+) ]] || return 0
+    major=${BASH_REMATCH[1]}
+    minor=${BASH_REMATCH[2]}
+    ! (( major == 1 || (major == 2 && minor < 7) ))
+}
+
 # caddy_service_state reports the systemd load state for caddy.service.
 # A binary alone is not a working proxy: the service owns its runtime
 # directory and starts the process, while the installer only adds a
@@ -323,25 +340,37 @@ ensure_docker() {
 # write_caddy_baseline installs the base proxy config: admin over the
 # unix socket, automatic HTTPS at Caddy's default (enabled), and an
 # empty tinyship server that the worker replaces wholesale at deploy
-# time. The admin address has no permission suffix because Caddy 2.6
-# treats that suffix as part of the socket path; the unit's
-# ExecStartPost applies mode 0660 instead. The origins list admits the
-# "caddy" Host used by the admin client on Caddy 2.6, whose admin
-# endpoint checks Host. Existing content is kept, except the known old
-# admin value is upgraded in place.
+# time. The admin address carries the permission suffix only when the
+# installed Caddy understands it (2.7+): Caddy 2.6 would read the
+# suffixed value as part of the socket filename, so there the unit's
+# ExecStartPost waits for the socket and applies mode 0660 instead. The
+# origins list admits the "caddy" Host used by the admin client on
+# Caddy 2.6, whose admin endpoint checks Host. Existing content is
+# kept, except the admin value is migrated to the form this Caddy
+# needs.
 write_caddy_baseline() {
     local path="$INSTALL_ROOT/etc/caddy/caddy.json"
+    local listen="unix//run/caddy/admin.sock"
+    if caddy_supports_socket_mode; then
+        listen="$listen|0660"
+    fi
     if [[ -e "$path" ]]; then
-        # A previous install may have the old socket-filename suffix, or
-        # may predate the admin origin added for Caddy 2.6. Rewrite only
-        # the exact admin value so the rest of the file stays untouched.
-        if grep -qF 'unix//run/caddy/admin.sock|0660' "$path"; then
+        # A previous install may carry the admin socket in the other
+        # direction for this Caddy, or may predate the admin origins
+        # added for Caddy 2.6. Rewrite only the admin value so the rest
+        # of the file stays untouched.
+        if [[ "$listen" == *'|0660' ]]; then
+            if grep -qF '"listen": "unix//run/caddy/admin.sock"' "$path"; then
+                sed -i 's#"listen": "unix//run/caddy/admin.sock"#"listen": "unix//run/caddy/admin.sock|0660"#' "$path"
+                log "added the admin socket permission suffix to $path"
+            fi
+        elif grep -qF 'unix//run/caddy/admin.sock|0660' "$path"; then
             sed -i 's#unix//run/caddy/admin.sock|0660#unix//run/caddy/admin.sock#g' "$path"
             log "removed the Caddy 2.6 admin socket suffix from $path"
         fi
-        if grep -qF 'unix//run/caddy/admin.sock' "$path" \
+        if grep -qE '"listen": "unix//run/caddy/admin.sock(\|0660)?"' "$path" \
             && ! grep -qF '"origins"' "$path"; then
-            sed -i 's#"listen": "unix//run/caddy/admin.sock"#"listen": "unix//run/caddy/admin.sock", "origins": ["caddy", "localhost", "127.0.0.1"]#' "$path"
+            sed -E -i 's#"listen": "unix//run/caddy/admin.sock(\|0660)?"#"listen": "unix//run/caddy/admin.sock\1", "origins": ["caddy", "localhost", "127.0.0.1"]#' "$path"
             log "added the admin socket origins to $path"
         fi
         chmod 0640 "$path"
@@ -355,9 +384,9 @@ write_caddy_baseline() {
         return 0
     fi
     install -d -m 0755 "$(dirname "$path")"
-    cat >"$path" <<'EOF'
+    cat >"$path" <<EOF
 {
-  "admin": {"listen": "unix//run/caddy/admin.sock", "origins": ["caddy", "localhost", "127.0.0.1"]},
+  "admin": {"listen": "$listen", "origins": ["caddy", "localhost", "127.0.0.1"]},
   "apps": {"http": {"servers": {"tinyship": {}}}}
 }
 EOF
@@ -371,16 +400,19 @@ EOF
 # write_caddy_unit installs the systemd drop-ins that point Caddy at
 # the TinyShip baseline. The service group makes the admin socket group
 # caddy-admin, which tinyship-worker joins; RuntimeDirectory creates
-# /run/caddy. ExecStartPost sets the socket mode after Caddy has opened
-# it, which works on Caddy 2.6 where a listen-address permission suffix
-# is not supported. When the package's caddy group exists, the process
-# keeps it as a supplementary group so it can still read a root:caddy
-# config. The OOM score keeps the proxy below app containers when the
-# kernel has to choose a victim. The main drop-in is never overwritten,
-# but missing compatibility lines are added on an upgraded host; the
-# small OOM drop-in is also added when the main file already exists.
+# /run/caddy. ExecStartPost waits for the socket to appear and then
+# applies mode 0660: a one-shot chmod races the socket's creation on a
+# unit that is not Type=notify, and Caddy 2.6 has no listen-address
+# permission suffix to rely on. When the package's caddy group exists,
+# the process keeps it as a supplementary group so it can still read a
+# root:caddy config. The OOM score keeps the proxy below app containers
+# when the kernel has to choose a victim. The main drop-in is never
+# overwritten, but missing or older compatibility lines are upgraded on
+# a re-run; the small OOM drop-in is also added when the main file
+# already exists.
 write_caddy_unit() {
     local caddy_bin caddy_state caddy_group dropin oom_dropin
+    local socket_chmod='ExecStartPost=-/bin/sh -c "seq 50 | while read n; do test -S /run/caddy/admin.sock && break; sleep 0.1; done; /bin/chmod 0660 /run/caddy/admin.sock"'
     caddy_bin=$(resolve_caddy)
     caddy_state=$(caddy_service_state)
     caddy_group=""
@@ -406,9 +438,15 @@ write_caddy_unit() {
             printf '\n%s\n' "$caddy_group" >>"$dropin"
             log "added $caddy_group to $dropin"
         fi
-        if ! grep -qF 'ExecStartPost=-/bin/chmod 0660 /run/caddy/admin.sock' "$dropin"; then
-            printf '\n%s\n' 'ExecStartPost=-/bin/chmod 0660 /run/caddy/admin.sock' >>"$dropin"
-            log "added admin socket permissions to $dropin"
+        if ! grep -qxF "$socket_chmod" "$dropin"; then
+            if grep -qxF 'ExecStartPost=-/bin/chmod 0660 /run/caddy/admin.sock' "$dropin"; then
+                sed -i '/^ExecStartPost=-\/bin\/chmod 0660 \/run\/caddy\/admin\.sock$/d' "$dropin"
+                printf '%s\n' "$socket_chmod" >>"$dropin"
+                log "upgraded the admin socket chmod to wait for the socket in $dropin"
+            else
+                printf '\n%s\n' "$socket_chmod" >>"$dropin"
+                log "added admin socket permissions to $dropin"
+            fi
         fi
         log "existing $dropin kept (idempotent install)"
     else
@@ -421,7 +459,7 @@ RuntimeDirectoryMode=0755
 $caddy_group
 ExecStart=
 ExecStart=$caddy_bin run --config /etc/caddy/caddy.json
-ExecStartPost=-/bin/chmod 0660 /run/caddy/admin.sock
+$socket_chmod
 EOF
         chmod 0644 "$dropin"
         log "installed $dropin (reload with: systemctl daemon-reload && systemctl restart caddy)"
