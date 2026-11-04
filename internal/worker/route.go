@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -174,6 +175,12 @@ func (p *Deployer) applyServer(ctx context.Context, rows []store.RouteRow, ov *c
 	}
 	hash, err := p.Caddy.ApplyServer(ctx, server)
 	if err != nil {
+		if errors.Is(err, fs.ErrPermission) {
+			// The admin socket refuses this process (wrong mode or
+			// group membership). Only repairing the socket can help,
+			// so the retry budget must not be spent on it.
+			return "", &pipelineError{code: "E_CADDY_APPLY", err: err}
+		}
 		var ue *caddy.UnreachableError
 		if errors.As(err, &ue) {
 			// Caddy restarting is transient; a rejected config is not.
@@ -289,6 +296,7 @@ func (p *Deployer) stepFinalCheck(ctx context.Context, d *deployRun) (any, error
 			} else {
 				p.Logger.Info("deploy: route restored to previous deployment",
 					"host", host)
+				d.routesRestored = true
 			}
 			return nil, &pipelineError{code: "E_FINAL_CHECK_FAILED", err: fmt.Errorf(
 				"probe of %s failed (status=%d, err=%v); route restored to the "+

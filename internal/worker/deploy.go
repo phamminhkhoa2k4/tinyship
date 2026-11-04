@@ -186,6 +186,7 @@ type deployRun struct {
 	oldContainerID string
 	oldGrace       time.Duration
 	oldStopped     bool
+	routesRestored bool // the proxy was regenerated from the database after a failure
 	skipped        bool // this step recorded its own skip row
 
 	failedStep string
@@ -878,20 +879,14 @@ func (p *Deployer) stepFinalize(ctx context.Context, d *deployRun) (any, error) 
 
 // --- failure recovery -------------------------------------------
 
-// recover runs after a permanent failure: record the failure,
-// clean up the new container, and for stop-first restart the previous
-// container so the app keeps serving. A failed restart is audited as
+// recover runs after a permanent failure: record the failure, bring the
+// previous container and the routes it served back, then clean up the
+// new container. The order keeps traffic on live upstreams: the route
+// returns to the database's truth while the old container is already
+// running and before the new one disappears, so no request is ever sent
+// to a removed container. A failed restart is audited as
 // needs_attention.
 func (p *Deployer) recover(ctx context.Context, d *deployRun, log *slog.Logger, se *stepError) {
-	if d.containerID != "" {
-		if err := p.Docker.RemoveContainer(ctx, d.containerID, true); err != nil &&
-			!strings.Contains(err.Error(), "No such container") {
-			log.Error("deploy: failed to clean up new container", "container",
-				p.short(d.containerID), "err", err)
-		} else {
-			log.Info("deploy: cleaned up new container", "container", p.short(d.containerID))
-		}
-	}
 	if d.oldStopped && d.oldContainerID != "" {
 		if err := p.Docker.StartContainer(ctx, d.oldContainerID); err != nil {
 			log.Error("deploy: previous container did not restart; app needs attention",
@@ -904,6 +899,32 @@ func (p *Deployer) recover(ctx context.Context, d *deployRun, log *slog.Logger, 
 		} else {
 			log.Info("deploy: restored previous container",
 				"container", p.short(d.oldContainerID))
+		}
+	}
+	// A failure at or after route_switch may have left the proxy aimed
+	// at this run's container, which is about to be removed.
+	// Regenerating from the database returns the routes to the last
+	// deployment that served traffic (or leaves a first deploy
+	// unrouted); final_check already did this when its own restore
+	// succeeded.
+	if len(d.domains) > 0 && p.Caddy != nil && !d.routesRestored {
+		rows, err := p.Store.ListRouteRows(ctx)
+		if err != nil {
+			log.Error("deploy: could not rebuild routes during recovery", "err", err)
+		} else if _, err := p.applyServer(ctx, rows, nil); err != nil {
+			log.Error("deploy: route restore during recovery", "err", err)
+		} else {
+			log.Info("deploy: routes restored to the previous deployment")
+			d.routesRestored = true
+		}
+	}
+	if d.containerID != "" {
+		if err := p.Docker.RemoveContainer(ctx, d.containerID, true); err != nil &&
+			!strings.Contains(err.Error(), "No such container") {
+			log.Error("deploy: failed to clean up new container", "container",
+				p.short(d.containerID), "err", err)
+		} else {
+			log.Info("deploy: cleaned up new container", "container", p.short(d.containerID))
 		}
 	}
 }

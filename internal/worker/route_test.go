@@ -8,9 +8,11 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/tinyship/tinyship/internal/caddy"
@@ -26,6 +28,11 @@ type fakeCaddy struct {
 	hashes  []string
 	err     error
 	readErr error
+
+	calls   int            // ApplyServer invocations, including failed ones
+	failAt  int            // 1-based invocation that must fail (needs failErr)
+	failErr error          // the error failAt returns
+	onApply func(call int) // observes each successful apply, called unlocked
 }
 
 func (f *fakeCaddy) CurrentConfig(_ context.Context) (map[string]any, string, error) {
@@ -39,17 +46,31 @@ func (f *fakeCaddy) CurrentConfig(_ context.Context) (map[string]any, string, er
 
 func (f *fakeCaddy) ApplyServer(_ context.Context, server map[string]any) (string, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.calls++
+	call := f.calls
+	if call == f.failAt && f.failErr != nil {
+		err := f.failErr
+		f.mu.Unlock()
+		return "", err
+	}
 	if f.err != nil {
-		return "", f.err
+		err := f.err
+		f.mu.Unlock()
+		return "", err
 	}
 	h, err := caddy.Hash(server)
 	if err != nil {
+		f.mu.Unlock()
 		return "", err
 	}
 	f.applies = append(f.applies, server)
 	f.hashes = append(f.hashes, h)
 	f.current = server
+	hook := f.onApply
+	f.mu.Unlock()
+	if hook != nil {
+		hook(call)
+	}
 	return h, nil
 }
 
@@ -215,6 +236,85 @@ func TestDeployRouteSwitchRetriesWhenCaddyUnreachable(t *testing.T) {
 	// Attempt 1 of 5: unreachable is transient, so the job requeues.
 	if err := f.run(1, 5); !Retryable(err) {
 		t.Errorf("deploy = %v, want retryable (Caddy restarting)", err)
+	}
+}
+
+func TestDeployRouteSwitchSocketPermissionDeniedIsPermanent(t *testing.T) {
+	f := newDeployFixture(t, happyConfig)
+	f.attachDomain("web.example.com")
+	f.dplr.Caddy = &fakeCaddy{err: &caddy.UnreachableError{Err: &os.PathError{
+		Op: "dial", Path: "/run/caddy/admin.sock", Err: syscall.EACCES}}}
+	f.dplr.Probe = func(context.Context, string) (int, error) { return 200, nil }
+
+	err := f.run(1, 5)
+	if err == nil {
+		t.Fatal("deploy = nil, want E_CADDY_APPLY")
+	}
+	if !strings.Contains(err.Error(), "E_CADDY_APPLY") {
+		t.Errorf("err = %v, want E_CADDY_APPLY", err)
+	}
+	if Retryable(err) {
+		t.Errorf("err = %v, want permanent: retrying cannot change the socket mode", err)
+	}
+	d := f.deployment()
+	if d.State != store.DepFailed {
+		t.Errorf("state = %q, want failed", d.State)
+	}
+	if d.FailureStep == nil || *d.FailureStep != "route_switch" {
+		t.Errorf("failure step = %v, want route_switch", d.FailureStep)
+	}
+}
+
+func TestDeployRecoveryRestoresRoutesBeforeRemovingTheNewContainer(t *testing.T) {
+	f := newDeployFixture(t, writableVolumeConfig)
+	f.attachDomain("web.example.com")
+	fc := &fakeCaddy{}
+	f.dplr.Caddy = fc
+	f.dplr.Probe = func(context.Context, string) (int, error) { return 200, nil }
+	if err := f.run(1, 1); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	first := f.deployment()
+	oldID := *first.ContainerID
+	oldPort := *first.HostPort
+
+	f.queueRedeploy(writableVolumeConfig, false)
+	// Call 3 is final_check's own restore: it fails, so the recovery
+	// (call 4) is the one that must bring the routes back.
+	fc.failAt, fc.failErr = 3, errors.New("verify read after apply failed")
+	fc.onApply = func(call int) {
+		if call != 4 {
+			return
+		}
+		if got := f.fk.stateOf(oldID); got != "running" {
+			t.Errorf("previous container state at route restore = %q, want running first", got)
+		}
+		if n := f.fk.containerCount(); n != 2 {
+			t.Errorf("containers at route restore = %d, want 2 (the new one goes last)", n)
+		}
+	}
+	f.dplr.Probe = func(context.Context, string) (int, error) { return 502, nil }
+
+	err := f.run(1, 1)
+	if err == nil || !strings.Contains(err.Error(), "E_FINAL_CHECK_FAILED") {
+		t.Fatalf("deploy = %v, want E_FINAL_CHECK_FAILED", err)
+	}
+	if fc.calls != 4 || fc.count() != 3 {
+		t.Errorf("calls = %d, applies = %d, want 4 and 3 (one restore failed)",
+			fc.calls, fc.count())
+	}
+	d := f.deployment()
+	if d.State != store.DepFailed || d.FailureStep == nil || *d.FailureStep != "final_check" {
+		t.Fatalf("deployment = %q/%v, want failed/final_check", d.State, d.FailureStep)
+	}
+	if n := f.fk.containerCount(); n != 1 || f.fk.stateOf(oldID) != "running" {
+		t.Errorf("containers = %d (previous state %q), want only the running previous one",
+			n, f.fk.stateOf(oldID))
+	}
+	body := routeBody(t, fc.last())
+	if !strings.Contains(body, "web.example.com") ||
+		!strings.Contains(body, "127.0.0.1:"+strconv.Itoa(oldPort)) {
+		t.Errorf("last applied config does not route back to port %d: %s", oldPort, body)
 	}
 }
 
