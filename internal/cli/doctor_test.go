@@ -206,6 +206,9 @@ func TestCheckProxyFailsWhenAdminSocketHidesTheWorker(t *testing.T) {
 	if err := os.WriteFile(sock, nil, 0o200); err != nil {
 		t.Fatalf("socket file: %v", err)
 	}
+	if err := os.Chmod(sock, 0o200); err != nil {
+		t.Fatalf("socket mode: %v", err)
+	}
 	t.Setenv("TINYSHIP_CADDY_ADMIN", sock)
 	stubDoctor(t, &doctorLookPath, func(string) (string, error) { return "/usr/bin/found", nil })
 	stubDoctor(t, &doctorCaddyService, func(context.Context) (string, string, error) {
@@ -228,6 +231,11 @@ func TestCheckProxyPassesWhenAdminSocketAdmitsTheWorker(t *testing.T) {
 	sock := filepath.Join(t.TempDir(), "admin.sock")
 	if err := os.WriteFile(sock, nil, 0o660); err != nil {
 		t.Fatalf("socket file: %v", err)
+	}
+	// WriteFile's mode only holds for the bits the umask leaves alone;
+	// set the mode outright so the check under test sees 0660.
+	if err := os.Chmod(sock, 0o660); err != nil {
+		t.Fatalf("socket mode: %v", err)
 	}
 	t.Setenv("TINYSHIP_CADDY_ADMIN", sock)
 	stubDoctor(t, &doctorLookPath, func(string) (string, error) { return "/usr/bin/found", nil })
