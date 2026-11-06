@@ -74,8 +74,12 @@ type Config struct {
 	RunDir string
 	Docker Docker
 	// Caddy, when set, makes the worker regenerate the proxy config
-	// from the database at startup (crash recovery for route state).
+	// from the database at startup and on every route-sync tick
+	// (crash recovery for route state).
 	Caddy Caddy
+	// RouteSyncInterval is the proxy config convergence period;
+	// default DefaultRouteSyncInterval.
+	RouteSyncInterval time.Duration
 }
 
 // Run starts the worker and blocks until ctx is cancelled. argv is accepted
@@ -92,6 +96,20 @@ func Run(ctx context.Context, argv []string) int {
 		ClaimInterval: time.Second,
 		ReapInterval:  store.ReapEvery,
 		Logger:        logger,
+	}
+	// Route-sync period: development and test hosts use it to wait out
+	// a convergence tick instead of the production interval. A value
+	// that cannot be a positive duration is refused rather than
+	// silently replaced — disabling the sync would reintroduce the
+	// route outage it exists to prevent.
+	if v := os.Getenv("TINYSHIP_ROUTE_SYNC"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			logger.Error("worker: TINYSHIP_ROUTE_SYNC must be a positive Go duration",
+				"value", v)
+			return 1
+		}
+		cfg.RouteSyncInterval = d
 	}
 	if host, err := os.Hostname(); err == nil {
 		cfg.WorkerID = fmt.Sprintf("%s-%d", host, os.Getpid())
@@ -121,8 +139,9 @@ func Run(ctx context.Context, argv []string) int {
 	}
 
 	// Route engine: the deployer talks to the Caddy admin socket, and
-	// boot regenerates the config from the database so routes always
-	// reflect the last succeeded deployments.
+	// regenerating the config from the database at boot and on every
+	// route-sync tick keeps routes reflecting the last succeeded
+	// deployments even when the proxy lost its config underneath us.
 	cc := caddy.NewClient(envOr("TINYSHIP_CADDY_ADMIN", caddy.DefaultSocket))
 	dplr := NewDeployer(s, dw, logger, cfg.WorkerID)
 	dplr.Caddy = cc
@@ -180,6 +199,9 @@ func RunStore(ctx context.Context, s *store.Store, cfg Config) error {
 	if cfg.GCInterval <= 0 {
 		cfg.GCInterval = DefaultGCInterval
 	}
+	if cfg.RouteSyncInterval <= 0 {
+		cfg.RouteSyncInterval = DefaultRouteSyncInterval
+	}
 	if cfg.Lease <= 0 {
 		cfg.Lease = store.LeaseDuration
 	}
@@ -200,7 +222,9 @@ func RunStore(ctx context.Context, s *store.Store, cfg Config) error {
 	// Converge proxy routes to the database before claiming jobs: a
 	// crash during a previous route switch must not leave traffic on a
 	// half-switched config. Failure is logged and non-fatal: route
-	// updates during deploys will surface it again with full context.
+	// updates during deploys will surface it again with full context,
+	// and the route-sync tick retries the same convergence for a
+	// proxy that goes away later.
 	if cfg.Caddy != nil {
 		if err := RegenerateRoutes(ctx, s, cfg.Caddy, logger); err != nil {
 			logger.Error("worker: boot route regeneration failed", "err", err)
@@ -278,6 +302,12 @@ func RunStore(ctx context.Context, s *store.Store, cfg Config) error {
 		defer tick.Stop()
 		collect = tick.C
 	}
+	var routeSync <-chan time.Time
+	if cfg.Caddy != nil {
+		tick := time.NewTicker(cfg.RouteSyncInterval)
+		defer tick.Stop()
+		routeSync = tick.C
+	}
 
 	// A one-shot daemon read waits for a sampling window, so run periodic
 	// samples off the job loop; a deploy claim must not queue behind stats.
@@ -306,6 +336,20 @@ func RunStore(ctx context.Context, s *store.Store, cfg Config) error {
 			logger.Info("worker: image collection",
 				"removed", len(res.Removed), "freed_bytes", res.FreedBytes,
 				"skipped", len(res.Skipped))
+		case <-routeSync:
+			// Converge the live proxy config to the database. The
+			// proxy restarts from its baseline file, which carries no
+			// routes: a proxy restart, crash, or installer re-run
+			// would otherwise leave this worker's host serving nothing
+			// until something else re-applied. It runs here rather
+			// than in a goroutine because handlers execute inline in
+			// this loop — a sync must never interleave with a deploy's
+			// route switch. RegenerateRoutes only writes when the live
+			// config differs, so a healthy proxy costs one read; a
+			// failed sync is logged and retried on the next tick.
+			if err := RegenerateRoutes(ctx, s, cfg.Caddy, logger); err != nil {
+				logger.Warn("worker: route sync failed", "err", err)
+			}
 		case <-reap.C:
 			requeued, failed, err := s.ReapExpired(ctx, time.Now().UTC())
 			if err != nil {

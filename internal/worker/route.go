@@ -21,6 +21,13 @@ import (
 // config the worker last applied successfully.
 const CaddyConfigHashKey = "caddy_config_hash"
 
+// DefaultRouteSyncInterval is how often the worker compares the live
+// proxy config against the database. It bounds how long routing stays
+// down after the proxy loses its configuration underneath a running
+// worker: a proxy restart, crash, or installer re-run reloads the
+// baseline file, which carries no routes.
+const DefaultRouteSyncInterval = 15 * time.Second
+
 // Caddy is the subset of the route engine the deploy pipeline needs. The
 // production implementation is *caddy.Client over the admin socket;
 // tests inject a fake.
@@ -93,9 +100,11 @@ func DefaultProbe(ctx context.Context, hostname string) (int, error) {
 // restart the routes converge to the last succeeded deployments, no
 // matter where the previous process died. The live check matters because
 // the proxy starts from its baseline file and does not persist API
-// updates across a service or host restart. A host that never routed
-// anything and has no active domains is a no-op, so fresh installs do
-// not touch the proxy baseline.
+// updates across a service or host restart — the worker calls this at
+// boot and on every route-sync tick, so a worker that is already
+// running also notices a proxy that lost its config underneath it. A
+// host that never routed anything and has no active domains is a
+// no-op, so fresh installs do not touch the proxy baseline.
 func RegenerateRoutes(ctx context.Context, s *store.Store, cc Caddy, log *slog.Logger) error {
 	rows, err := s.ListRouteRows(ctx)
 	if err != nil {

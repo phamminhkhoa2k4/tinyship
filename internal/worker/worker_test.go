@@ -259,4 +259,56 @@ func TestWorkerRecoversOrphanedJob(t *testing.T) {
 	}
 }
 
+// TestWorkerRouteSyncRestoresWipedProxyConfig proves a worker that is
+// already running re-applies routes the proxy lost underneath it — a
+// proxy restart comes back from the baseline file with no routes —
+// without a restart of its own, and that an in-sync proxy is not
+// re-applied on every tick.
+func TestWorkerRouteSyncRestoresWipedProxyConfig(t *testing.T) {
+	s := testStore(t)
+	createRoutedApp(t, s, "web", "web.example.com", 20017)
+	fc := &fakeCaddy{}
+
+	stop := runWorker(t, s, Config{
+		ClaimInterval:     10 * time.Millisecond,
+		RouteSyncInterval: 20 * time.Millisecond,
+		Caddy:             fc,
+	})
+	defer stop()
+
+	waitFor(t, "boot applies the routes", func() bool {
+		return fc.count() >= 1
+	})
+
+	// The proxy comes back from a restart with only its baseline
+	// config; the recorded hash and the database are untouched.
+	fc.forgetCurrent()
+
+	waitFor(t, "route sync restores the wiped config", func() bool {
+		return fc.count() >= 2 &&
+			strings.Contains(routeBody(t, fc.last()), "web.example.com")
+	})
+
+	// Once back in sync, further ticks must not write to the proxy.
+	applies := fc.count()
+	time.Sleep(100 * time.Millisecond) // five sync ticks
+	if got := fc.count(); got != applies {
+		t.Errorf("applies while in sync = %d, want %d (rewrote a healthy proxy)",
+			got, applies)
+	}
+}
+
+// waitFor polls cond until it holds or the deadline passes.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("%s: condition never held within 5s", what)
+}
+
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
