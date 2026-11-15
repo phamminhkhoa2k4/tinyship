@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 func validConfig() *Config {
@@ -369,3 +370,81 @@ func contains(list []string, want string) bool {
 }
 
 func intPtr(v int) *int { return &v }
+
+// --- metrics -------------------------------------------------------
+
+func TestMetricsAbsentReadsAsDefaultOn(t *testing.T) {
+	c, err := Parse([]byte(`{"name":"web","image":"nginx","port":8080}`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	// Configs written before the field existed must read as documented:
+	// collection on, every 30s, kept 30 days.
+	if !c.MetricsEnabled() {
+		t.Error("absent metrics.enabled reads as off, want default on")
+	}
+	if c.MetricsInterval() != time.Duration(DefaultMetricsIntervalS)*time.Second {
+		t.Errorf("interval = %v, want %ds", c.MetricsInterval(), DefaultMetricsIntervalS)
+	}
+	if c.MetricsRetention() != time.Duration(DefaultMetricsRetentionDays)*24*time.Hour {
+		t.Errorf("retention = %v, want %d days", c.MetricsRetention(), DefaultMetricsRetentionDays)
+	}
+
+	off, err := Parse([]byte(
+		`{"name":"web","image":"nginx","port":8080,"metrics":{"enabled":false}}`))
+	if err != nil {
+		t.Fatalf("parse explicit off: %v", err)
+	}
+	if off.MetricsEnabled() {
+		t.Error("explicit false reads as on, want off")
+	}
+}
+
+func TestValidateMetricsDefaultsAndRanges(t *testing.T) {
+	c := validConfig()
+	if _, err := Validate(c); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if c.Metrics.Enabled == nil || !*c.Metrics.Enabled {
+		t.Errorf("enabled default = %v, want true", c.Metrics.Enabled)
+	}
+	if c.Metrics.IntervalS != DefaultMetricsIntervalS ||
+		c.Metrics.RetentionDays != DefaultMetricsRetentionDays {
+		t.Errorf("defaults = %+v, want %ds/%dd",
+			c.Metrics, DefaultMetricsIntervalS, DefaultMetricsRetentionDays)
+	}
+
+	// An explicit off survives validation.
+	c = validConfig()
+	off := false
+	c.Metrics.Enabled = &off
+	if _, err := Validate(c); err != nil {
+		t.Fatalf("Validate off: %v", err)
+	}
+	if c.Metrics.Enabled == nil || *c.Metrics.Enabled {
+		t.Errorf("explicit off = %v, want false", c.Metrics.Enabled)
+	}
+
+	c = validConfig()
+	c.Metrics.IntervalS = MinMetricsIntervalS - 1
+	if _, err := Validate(c); err == nil || !strings.Contains(err.Error(), "metrics.interval_s") {
+		t.Errorf("interval below min = %v", err)
+	}
+	c = validConfig()
+	c.Metrics.IntervalS = MaxMetricsIntervalS + 1
+	if _, err := Validate(c); err == nil || !strings.Contains(err.Error(), "metrics.interval_s") {
+		t.Errorf("interval above max = %v", err)
+	}
+	c = validConfig()
+	c.Metrics.RetentionDays = MaxMetricsRetentionDays + 1
+	if _, err := Validate(c); err == nil || !strings.Contains(err.Error(), "metrics.retention_days") {
+		t.Errorf("retention above max = %v", err)
+	}
+}
+
+func TestParseRejectsUnknownMetricsField(t *testing.T) {
+	raw := []byte(`{"name":"web","image":"nginx","port":80,"metrics":{"intervall_s":30}}`)
+	if _, err := Parse(raw); err == nil || !strings.Contains(err.Error(), "intervall_s") {
+		t.Fatalf("unknown metrics field = %v, want error naming it", err)
+	}
+}

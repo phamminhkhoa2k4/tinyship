@@ -11,6 +11,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // Size limits.
@@ -33,14 +34,21 @@ const (
 	DefaultStopGraceS   = 30
 	DefaultStartPeriodS = 30 // health.start_period_s default
 	DefaultKeepReleases = 3  // images retained per app before gc may remove them
-	MinKeepReleases     = 1
-	MaxKeepReleases     = 50
-	MinMemoryMB         = 32
-	MinCPUMillis        = 50
-	MinPidsLimit        = 16
-	MaxPidsLimit        = 4096
-	AllowedCapAdd       = "NET_BIND_SERVICE" // the one capability the config may add
-	TINYSHIPEnvPrefix   = "TINYSHIP_"
+	// metrics defaults: collection on, sampled every 30s, kept 30 days.
+	DefaultMetricsIntervalS     = 30
+	DefaultMetricsRetentionDays = 30
+	MinMetricsIntervalS         = 30
+	MaxMetricsIntervalS         = 3600
+	MinMetricsRetentionDays     = 1
+	MaxMetricsRetentionDays     = 365
+	MinKeepReleases             = 1
+	MaxKeepReleases             = 50
+	MinMemoryMB                 = 32
+	MinCPUMillis                = 50
+	MinPidsLimit                = 16
+	MaxPidsLimit                = 4096
+	AllowedCapAdd               = "NET_BIND_SERVICE" // the one capability the config may add
+	TINYSHIPEnvPrefix           = "TINYSHIP_"
 )
 
 var (
@@ -76,6 +84,9 @@ type Config struct {
 	// a container still uses them.
 	KeepReleases       int    `json:"keep_releases,omitempty"`
 	RegistryCredential string `json:"registry_credential,omitempty"`
+	// Metrics bounds resource-sample collection for this app; absent
+	// values read as the documented default (on, every 30s, 30 days).
+	Metrics Metrics `json:"metrics,omitempty"`
 }
 
 // Health describes the host-run health probe.
@@ -100,6 +111,40 @@ type Resources struct {
 	MemoryMB  int `json:"memory_mb,omitempty"`
 	CPUMillis int `json:"cpu_millis,omitempty"`
 	PidsLimit int `json:"pids_limit,omitempty"`
+}
+
+// Metrics controls resource-sample collection for one app.
+type Metrics struct {
+	// Enabled is a pointer so JSON can distinguish "absent" (default
+	// on) from an explicit false.
+	Enabled       *bool `json:"enabled,omitempty"`
+	IntervalS     int   `json:"interval_s,omitempty"`
+	RetentionDays int   `json:"retention_days,omitempty"`
+}
+
+// MetricsEnabled reports whether sample collection runs for this
+// config: an absent field (configs written before the field existed)
+// reads as the documented default, on.
+func (c *Config) MetricsEnabled() bool {
+	return c.Metrics.Enabled == nil || *c.Metrics.Enabled
+}
+
+// MetricsInterval is the effective interval between stored samples.
+func (c *Config) MetricsInterval() time.Duration {
+	s := c.Metrics.IntervalS
+	if s == 0 {
+		s = DefaultMetricsIntervalS
+	}
+	return time.Duration(s) * time.Second
+}
+
+// MetricsRetention is how long the app's samples are kept.
+func (c *Config) MetricsRetention() time.Duration {
+	d := c.Metrics.RetentionDays
+	if d == 0 {
+		d = DefaultMetricsRetentionDays
+	}
+	return time.Duration(d) * 24 * time.Hour
 }
 
 // Tmpfs is an in-memory mount for read-only-rootfs apps.
@@ -280,6 +325,27 @@ func Validate(c *Config) (warnings []string, err error) {
 	}
 	if errH := validateHealth(c.Health, c.Port, &warnings); errH != nil {
 		add("health: %v", errH)
+	}
+
+	// metrics: collection defaults to on; an absent field must stay
+	// distinguishable from an explicit false, hence the pointer.
+	if c.Metrics.Enabled == nil {
+		on := true
+		c.Metrics.Enabled = &on
+	}
+	if c.Metrics.IntervalS == 0 {
+		c.Metrics.IntervalS = DefaultMetricsIntervalS
+	}
+	if c.Metrics.IntervalS < MinMetricsIntervalS || c.Metrics.IntervalS > MaxMetricsIntervalS {
+		add("metrics.interval_s: %d out of range %d-%d",
+			c.Metrics.IntervalS, MinMetricsIntervalS, MaxMetricsIntervalS)
+	}
+	if c.Metrics.RetentionDays == 0 {
+		c.Metrics.RetentionDays = DefaultMetricsRetentionDays
+	}
+	if c.Metrics.RetentionDays < MinMetricsRetentionDays || c.Metrics.RetentionDays > MaxMetricsRetentionDays {
+		add("metrics.retention_days: %d out of range %d-%d",
+			c.Metrics.RetentionDays, MinMetricsRetentionDays, MaxMetricsRetentionDays)
 	}
 
 	// defaults

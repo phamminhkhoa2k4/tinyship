@@ -1,21 +1,23 @@
 package cli
 
 import (
-	"context"
+	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tinyship/tinyship/internal/store"
 	"github.com/tinyship/tinyship/internal/upgrade"
 )
 
-// upgradeSandbox builds an install root the way a host would look: a
-// migrated database under the data directory and an installed binary
-// that answers version --json. The candidate build and its checksum
-// live outside the root. Returns the root, the candidate path and the
-// checksum.
+// upgradeSandbox builds an install root the way an old host would look:
+// a database whose schema stops at the installed version and an
+// installed binary that answers version --json. The candidate build and
+// its checksum live outside the root. Returns the root, the candidate
+// path and the checksum.
 func upgradeSandbox(t *testing.T, installedVer string, installedSchema int, candVer string, candSchema int) (root, cand, sum string) {
 	t.Helper()
 	root = t.TempDir()
@@ -23,11 +25,9 @@ func upgradeSandbox(t *testing.T, installedVer string, installedSchema int, cand
 	if err := os.MkdirAll(filepath.Dir(db), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	s, err := store.Open(context.Background(), db)
-	if err != nil {
-		t.Fatalf("migrate sandbox db: %v", err)
+	if err := buildSchemaAt(db, installedSchema); err != nil {
+		t.Fatalf("build sandbox schema %d: %v", installedSchema, err)
 	}
-	s.Close()
 	binDir := filepath.Join(root, "usr/local/bin")
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -35,11 +35,40 @@ func upgradeSandbox(t *testing.T, installedVer string, installedSchema int, cand
 	writeFakeBuild(t, filepath.Join(binDir, "tinyship"), installedVer, installedSchema)
 	cand = filepath.Join(t.TempDir(), "candidate")
 	writeFakeBuild(t, cand, candVer, candSchema)
-	sum, err = upgrade.FileSHA256(cand)
+	sum, err := upgrade.FileSHA256(cand)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return root, cand, sum
+}
+
+// buildSchemaAt applies exactly the migrations up to version, recording
+// each like the runner does, so the database looks like an install from
+// that schema level rather than a fresh migrate to the newest.
+func buildSchemaAt(path string, version int) error {
+	migrations, err := store.Migrations()
+	if err != nil {
+		return err
+	}
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	for _, m := range migrations {
+		if m.Version > version {
+			break
+		}
+		if _, err := db.Exec(m.SQL); err != nil {
+			return fmt.Errorf("migration %04d: %w", m.Version, err)
+		}
+		if _, err := db.Exec(
+			`INSERT INTO schema_migrations(version,name,checksum,applied_at) VALUES(?,?,?,?)`,
+			m.Version, m.Name, m.Checksum, time.Now().UTC().UnixMilli()); err != nil {
+			return fmt.Errorf("record migration %04d: %w", m.Version, err)
+		}
+	}
+	return nil
 }
 
 func writeFakeBuild(t *testing.T, path, ver string, schema int) {

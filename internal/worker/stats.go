@@ -38,6 +38,12 @@ type AppStats struct {
 	NearLimit    bool      `json:"near_limit"`
 	OOMKillCount int       `json:"oom_kill_count"`
 	SampledAt    time.Time `json:"sampled_at"`
+
+	// sampled marks a fresh daemon stats read behind this view, and
+	// memBytes keeps the untruncated reading; both stay unexported so
+	// the socket payload is unchanged.
+	sampled  bool
+	memBytes uint64
 }
 
 // StatsStore is the store slice the sampler needs.
@@ -45,6 +51,9 @@ type StatsStore interface {
 	ListApps(ctx context.Context) ([]*store.App, error)
 	ListContainerStates(ctx context.Context) (map[string]*store.ContainerState, error)
 	UpsertContainerState(ctx context.Context, in store.ContainerState) error
+	AppendMetricSample(ctx context.Context, in store.MetricSample) error
+	RollupMetricSamples(ctx context.Context, rawBefore time.Time) error
+	PruneMetricSamples(ctx context.Context, appID string, before time.Time) error
 }
 
 // StatsSampler measures managed containers and persists the observations.
@@ -56,14 +65,31 @@ type StatsSampler struct {
 	Logger *slog.Logger
 
 	mu sync.Mutex
+	// lastSample gates each app's history append to its configured
+	// interval; lastSweep paces the hourly rollup/prune pass. Both are
+	// in-memory on purpose: a restart re-samples on the next tick,
+	// which costs at most one duplicated row.
+	lastSample map[string]time.Time
+	lastSweep  time.Time
 }
+
+// Metrics history policy: raw samples stay raw for the raw window, then
+// the sweep folds them into hourly rows; the sweep itself runs hourly on
+// the sampling tick.
+const (
+	metricsRawWindow  = 48 * time.Hour
+	metricsSweepEvery = time.Hour
+)
 
 // NewStatsSampler wires the sampler over a store and the Docker wrapper.
 func NewStatsSampler(s StatsStore, d Docker, log *slog.Logger) *StatsSampler {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &StatsSampler{Store: s, Docker: d, Logger: log}
+	return &StatsSampler{
+		Store: s, Docker: d, Logger: log,
+		lastSample: map[string]time.Time{},
+	}
 }
 
 // Sample reads every managed container once and returns the app views in
@@ -140,8 +166,60 @@ func (s *StatsSampler) Sample(ctx context.Context) ([]AppStats, error) {
 		}); err != nil {
 			s.Logger.Warn("worker: cannot store container stats", "app", app.Name, "err", err)
 		}
+		if st.sampled {
+			s.recordMetric(ctx, app, st, now)
+		}
 	}
+	s.sweepMetrics(ctx, apps, now)
 	return out, nil
+}
+
+// recordMetric appends one history row when the app has collection
+// enabled and its interval has elapsed. Only a fresh daemon reading is
+// recorded: a stopped or unreadable container has no usage to store, so
+// sleeping apps simply pause their history instead of freezing it.
+func (s *StatsSampler) recordMetric(ctx context.Context, app *store.App, st *AppStats, now time.Time) {
+	cfg, err := appconfig.Parse([]byte(app.ConfigJSON))
+	if err != nil || !cfg.MetricsEnabled() {
+		return
+	}
+	if last, ok := s.lastSample[app.ID]; ok && now.Sub(last) < cfg.MetricsInterval() {
+		return
+	}
+	if err := s.Store.AppendMetricSample(ctx, store.MetricSample{
+		AppID:         app.ID,
+		At:            now,
+		CPUPercent:    st.CPUPercent,
+		MemBytes:      int64(st.memBytes),
+		MemLimitBytes: int64(st.MemLimitMB) << 20,
+	}); err != nil {
+		s.Logger.Warn("worker: cannot store metric sample", "app", app.Name, "err", err)
+		return
+	}
+	s.lastSample[app.ID] = now
+}
+
+// sweepMetrics folds raw rows past the raw window into hourly rollups
+// and prunes each app past its own retention cap. It runs at most once
+// per metricsSweepEvery on the sampling tick; a failed sweep is logged
+// and retried on the next due tick, so no history is lost by skipping.
+func (s *StatsSampler) sweepMetrics(ctx context.Context, apps []*store.App, now time.Time) {
+	if now.Sub(s.lastSweep) < metricsSweepEvery {
+		return
+	}
+	s.lastSweep = now
+	if err := s.Store.RollupMetricSamples(ctx, now.Add(-metricsRawWindow)); err != nil {
+		s.Logger.Warn("worker: metric rollup failed", "err", err)
+	}
+	for _, app := range apps {
+		cfg, err := appconfig.Parse([]byte(app.ConfigJSON))
+		if err != nil {
+			continue
+		}
+		if err := s.Store.PruneMetricSamples(ctx, app.ID, now.Add(-cfg.MetricsRetention())); err != nil {
+			s.Logger.Warn("worker: metric prune failed", "app", app.Name, "err", err)
+		}
+	}
 }
 
 // fillContainer updates one app view from a managed container. Errors are
@@ -172,6 +250,8 @@ func (s *StatsSampler) fillContainer(ctx context.Context, st *AppStats,
 	}
 	st.MemUsageMB = int(sample.MemUsageBytes / (1 << 20))
 	st.CPUPercent = sample.CPUPercent
+	st.memBytes = sample.MemUsageBytes
+	st.sampled = true
 }
 
 // oomCount accumulates OOM kills across container replacements. The

@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -68,8 +69,9 @@ func TestBackupSandboxRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read backup: %v", err)
 	}
-	if arc.Manifest.SchemaVersion != 2 {
-		t.Errorf("schema_version = %d, want 2 (the migrated sandbox schema)", arc.Manifest.SchemaVersion)
+	if want := store.SchemaVersion(); arc.Manifest.SchemaVersion != want {
+		t.Errorf("schema_version = %d, want %d (the migrated sandbox schema)",
+			arc.Manifest.SchemaVersion, want)
 	}
 	want := []string{
 		"var/lib/tinyship/tinyship.db",
@@ -210,7 +212,8 @@ func TestBackupJSONSummary(t *testing.T) {
 	}
 	if !strings.Contains(stdout, `"path":"`+out) ||
 		!strings.Contains(stdout, `"encrypted":false`) ||
-		!strings.Contains(stdout, `"schema_version":2`) {
+		!strings.Contains(stdout,
+			fmt.Sprintf(`"schema_version":%d`, store.SchemaVersion())) {
 		t.Errorf("json summary wrong:\n%s", stdout)
 	}
 }

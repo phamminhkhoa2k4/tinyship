@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tinyship/tinyship/internal/docker"
 	"github.com/tinyship/tinyship/internal/policy"
@@ -174,5 +175,147 @@ func TestStatsSamplerCoversEveryApp(t *testing.T) {
 		if app.State != "running" || app.MemUsageMB != 16 {
 			t.Errorf("app %q = %+v, want running with 16 MiB", app.Name, app)
 		}
+	}
+}
+
+func TestStatsSamplerRecordsMetricHistory(t *testing.T) {
+	f := newDeployFixture(t, happyConfig)
+	if err := f.run(1, 5); err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	f.fk.mu.Lock()
+	f.fk.statMemBytes = 60 << 20
+	f.fk.statMemLimit = 64 << 20
+	f.fk.statCPUPct = 12.5
+	f.fk.mu.Unlock()
+
+	sampler := NewStatsSampler(f.s, f.fk, slog.New(slog.DiscardHandler))
+	if _, err := sampler.Sample(f.ctx); err != nil {
+		t.Fatalf("first sample: %v", err)
+	}
+	got, err := f.s.ListMetricSamples(f.ctx, f.app.ID, time.Time{})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("samples = %d, want 1", len(got))
+	}
+	if got[0].MemBytes != 60<<20 || got[0].CPUPercent != 12.5 {
+		t.Errorf("sample = %+v, want 60MiB at 12.5%%", got[0])
+	}
+	if got[0].MemLimitBytes != 64<<20 {
+		t.Errorf("limit = %d, want 64MiB", got[0].MemLimitBytes)
+	}
+
+	// The default interval (30s) gates the next append on the same
+	// sampler: an immediate second pass stores nothing new.
+	if _, err := sampler.Sample(f.ctx); err != nil {
+		t.Fatalf("second sample: %v", err)
+	}
+	got, err = f.s.ListMetricSamples(f.ctx, f.app.ID, time.Time{})
+	if err != nil || len(got) != 1 {
+		t.Errorf("samples after immediate re-sample = %d, err %v, want still 1", len(got), err)
+	}
+}
+
+func TestStatsSamplerSkipsDisabledMetrics(t *testing.T) {
+	disabled := strings.Replace(happyConfig, "{", `{"metrics": {"enabled": false},`, 1)
+	f := newDeployFixture(t, disabled)
+	if err := f.run(1, 5); err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	f.fk.mu.Lock()
+	f.fk.statMemBytes = 32 << 20
+	f.fk.statMemLimit = 64 << 20
+	f.fk.mu.Unlock()
+
+	sampler := NewStatsSampler(f.s, f.fk, slog.New(slog.DiscardHandler))
+	if _, err := sampler.Sample(f.ctx); err != nil {
+		t.Fatalf("sample: %v", err)
+	}
+	got, err := f.s.ListMetricSamples(f.ctx, f.app.ID, time.Time{})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("samples = %d for a disabled app, want 0", len(got))
+	}
+}
+
+func TestStatsSamplerSkipsAppsWithoutFreshStats(t *testing.T) {
+	f := newDeployFixture(t, happyConfig)
+	if err := f.run(1, 5); err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+
+	// The container is not running, so no fresh reading exists: a
+	// stopped app must pause its history instead of storing a stale
+	// value.
+	d := f.deployment()
+	f.fk.mu.Lock()
+	f.fk.containers[*d.ContainerID].state = "exited"
+	f.fk.mu.Unlock()
+
+	sampler := NewStatsSampler(f.s, f.fk, slog.New(slog.DiscardHandler))
+	if _, err := sampler.Sample(f.ctx); err != nil {
+		t.Fatalf("sample: %v", err)
+	}
+	got, err := f.s.ListMetricSamples(f.ctx, f.app.ID, time.Time{})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("samples = %d for a stopped app, want 0", len(got))
+	}
+}
+
+func TestStatsSamplerSweepRollsUpAndPrunes(t *testing.T) {
+	f := newDeployFixture(t, happyConfig)
+	if err := f.run(1, 5); err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	f.fk.mu.Lock()
+	f.fk.statMemBytes = 8 << 20
+	f.fk.statMemLimit = 64 << 20
+	f.fk.mu.Unlock()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	fold := now.Add(-50 * time.Hour)       // past the raw window
+	prune := now.Add(-40 * 24 * time.Hour) // past the 30-day cap
+	for _, at := range []time.Time{fold, prune} {
+		if err := f.s.AppendMetricSample(f.ctx, store.MetricSample{
+			AppID: f.app.ID, At: at, MemBytes: 1 << 20,
+		}); err != nil {
+			t.Fatalf("plant sample: %v", err)
+		}
+	}
+
+	// A fresh sampler has never swept, so its first pass runs both the
+	// rollup and the prune.
+	sampler := NewStatsSampler(f.s, f.fk, slog.New(slog.DiscardHandler))
+	if _, err := sampler.Sample(f.ctx); err != nil {
+		t.Fatalf("sample: %v", err)
+	}
+	got, err := f.s.ListMetricSamples(f.ctx, f.app.ID, time.Time{})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	var folded, prunedAway, fresh int
+	for _, m := range got {
+		switch {
+		case m.Aggregated:
+			folded++
+			if !m.At.Equal(fold.Truncate(time.Hour)) {
+				t.Errorf("rollup at %v, want hour %v", m.At, fold.Truncate(time.Hour))
+			}
+		case m.At.Equal(prune):
+			prunedAway++
+		case m.At.Equal(now):
+			fresh++
+		}
+	}
+	if folded != 1 || prunedAway != 0 || fresh != 1 {
+		t.Errorf("after sweep: folded=%d pruned=%d fresh=%d, want 1/0/1 (rows: %+v)",
+			folded, prunedAway, fresh, got)
 	}
 }
