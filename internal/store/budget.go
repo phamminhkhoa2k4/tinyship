@@ -12,23 +12,30 @@ import (
 // the admission step derives it from MemTotal on every check, so a RAM
 // upgrade takes effect without reconfiguring.
 const (
-	BudgetMBKey      = "budget_mb"
-	MinFreeDiskMBKey = "min_free_disk_mb"
-	CPUOvercommitKey = "cpu_overcommit"
+	BudgetMBKey         = "budget_mb"
+	MinFreeDiskMBKey    = "min_free_disk_mb"
+	CPUOvercommitKey    = "cpu_overcommit"
+	DiskForecastDaysKey = "disk_forecast_days"
 )
 
 // Defaults match the documented host budget: apps may use at most
 // min_free_disk_mb of free disk before pulls are refused, and the CPU
 // sum may exceed physical capacity by cpu_overcommit before a warning
-// is recorded.
+// is recorded. disk_forecast_days is the lead time at which a disk
+// that is filling starts warning.
 const (
-	DefaultMinFreeDiskMB = 3072
-	DefaultCPUOvercommit = 2.0
+	DefaultMinFreeDiskMB    = 3072
+	DefaultCPUOvercommit    = 2.0
+	DefaultDiskForecastDays = 14
 	// MinFreeDiskMBFloor and MaxFreeDiskMB bound the operator-set floor.
 	// Zero is rejected: the admission guard must not be silently
 	// disabled, and force never bypasses it.
 	MinFreeDiskMBFloor = 256
 	MaxFreeDiskMB      = 102400
+	// DiskForecastDaysFloor and MaxDiskForecastDays bound the forecast
+	// lead time an operator may configure.
+	DiskForecastDaysFloor = 1
+	MaxDiskForecastDays   = 90
 )
 
 // BudgetSettings is the host-level guardrail configuration.
@@ -41,13 +48,21 @@ type BudgetSettings struct {
 	// CPUOvercommit is the allowed cpu_millis/vCPU ratio before
 	// W_CPU_OVERCOMMIT; it never rejects a deploy on its own.
 	CPUOvercommit float64
+	// DiskForecastDays is the lead time at which a filling disk starts
+	// warning: the forecast event fires while the estimated days until
+	// full drops below it.
+	DiskForecastDays int
 }
 
 // GetBudgetSettings reads the guardrail settings, applying defaults for
 // absent values and rejecting unparsable ones (a garbage limit must
 // fail the check loudly, not silently disable it).
 func (s *Store) GetBudgetSettings(ctx context.Context) (*BudgetSettings, error) {
-	out := &BudgetSettings{MinFreeDiskMB: DefaultMinFreeDiskMB, CPUOvercommit: DefaultCPUOvercommit}
+	out := &BudgetSettings{
+		MinFreeDiskMB:    DefaultMinFreeDiskMB,
+		CPUOvercommit:    DefaultCPUOvercommit,
+		DiskForecastDays: DefaultDiskForecastDays,
+	}
 	rawBudget, err := s.GetSetting(ctx, BudgetMBKey)
 	if err != nil {
 		return nil, err
@@ -84,6 +99,18 @@ func (s *Store) GetBudgetSettings(ctx context.Context) (*BudgetSettings, error) 
 		}
 		out.CPUOvercommit = f
 	}
+	rawForecast, err := s.GetSetting(ctx, DiskForecastDaysKey)
+	if err != nil {
+		return nil, err
+	}
+	if rawForecast != "" {
+		n, err := strconv.Atoi(rawForecast)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("store: setting %s=%q is not a non-negative integer",
+				DiskForecastDaysKey, rawForecast)
+		}
+		out.DiskForecastDays = n
+	}
 	return out, nil
 }
 
@@ -105,6 +132,16 @@ func (s *Store) SetMinFreeDiskMB(ctx context.Context, mb int) error {
 			MinFreeDiskMBFloor, MaxFreeDiskMB)
 	}
 	return s.PutSetting(ctx, MinFreeDiskMBKey, strconv.Itoa(mb))
+}
+
+// SetDiskForecastDays overrides the forecast lead time. Bounded so a
+// typo cannot disable the warning or arm it decades out.
+func (s *Store) SetDiskForecastDays(ctx context.Context, days int) error {
+	if days < DiskForecastDaysFloor || days > MaxDiskForecastDays {
+		return fmt.Errorf("store: disk forecast days must be between %d and %d",
+			DiskForecastDaysFloor, MaxDiskForecastDays)
+	}
+	return s.PutSetting(ctx, DiskForecastDaysKey, strconv.Itoa(days))
 }
 
 // ListRunningApps returns apps the budget must account for: everything

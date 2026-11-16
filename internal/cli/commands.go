@@ -120,6 +120,7 @@ Required (unless -f): --name, --image, --port.
 		healthStart = fs.Int("health-start-period", -1, "seconds before probes count (default 30; 0 = start now)")
 		file        = fs.String("f", "", "read the config object from a JSON file instead of flags")
 		jsonOut     = fs.Bool("json", false, "print the API response verbatim as JSON")
+		dryRun      = fs.Bool("dry-run", false, "validate the config and show budget impact without creating the app")
 	)
 	var volumes volumeList
 	fs.Var(&volumes, "volume", "named volume name:path, repeatable (host paths are never bind-mounted)")
@@ -184,6 +185,10 @@ Required (unless -f): --name, --image, --port.
 		body = raw
 	}
 
+	if *dryRun {
+		return appCreateDryRun(ctx, body, stdout, stderr, *jsonOut)
+	}
+
 	c := newAPIClient()
 	resp, err := c.do(ctx, http.MethodPost, "/apps", body)
 	if err != nil {
@@ -222,6 +227,72 @@ Required (unless -f): --name, --image, --port.
 		fmt.Fprintf(stdout, "  warning: %s\n", warn)
 	}
 	fmt.Fprintf(stdout, "Deploy it with: tinyship deploy %s --wait\n", created.Name)
+	return 0
+}
+
+// appCreateDryRun validates the would-be config and reports its budget
+// impact without creating anything. The budget numbers come from the
+// API — the same accounting admission applies at deploy time — so the
+// verdict here matches what a real deploy would meet.
+func appCreateDryRun(ctx context.Context, body []byte, stdout, stderr io.Writer, jsonOut bool) int {
+	cfg, err := appconfig.Parse(body)
+	if err != nil {
+		fmt.Fprintf(stderr, "tinyship app create --dry-run: config: %v\n", err)
+		return 1
+	}
+	warnings, err := appconfig.Validate(cfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "tinyship app create --dry-run: invalid config: %v\n", err)
+		return 1
+	}
+	c := newAPIClient()
+	var budget struct {
+		BudgetMB     int    `json:"budget_mb"`
+		BudgetSource string `json:"budget_source"`
+		CommittedMB  int    `json:"committed_mb"`
+		FreeMB       int    `json:"free_mb"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, "/budget", nil, &budget); err != nil {
+		fmt.Fprintf(stderr, "tinyship app create --dry-run: %v\n", err)
+		return 1
+	}
+	// A name that is already taken makes the real create fail; say so
+	// here too. A 404 is the happy path.
+	exists := false
+	if resp, err := c.do(ctx, http.MethodGet, "/apps/"+cfg.Name, nil); err == nil {
+		resp.Body.Close()
+		exists = resp.StatusCode == http.StatusOK
+	}
+
+	requested := cfg.Resources.MemoryMB
+	after := budget.FreeMB - requested
+	if jsonOut {
+		out := map[string]any{
+			"name": cfg.Name, "created": false, "requested_mb": requested,
+			"budget_mb": budget.BudgetMB, "budget_source": budget.BudgetSource,
+			"committed_mb": budget.CommittedMB, "free_mb": budget.FreeMB,
+			"free_after_mb": after, "fits": after >= 0 && !exists,
+			"exists": exists, "warnings": warnings,
+		}
+		raw, _ := json.MarshalIndent(out, "", "  ")
+		fmt.Fprintln(stdout, string(raw))
+		return 0
+	}
+	fmt.Fprintf(stdout, "Dry run: app %q was not created.\n", cfg.Name)
+	fmt.Fprintf(stdout, "  requested: %d MiB of RAM for the new app\n", requested)
+	fmt.Fprintf(stdout, "  budget:    %d MiB (%s) — %d MiB committed by running apps, %d MiB free\n",
+		budget.BudgetMB, budget.BudgetSource, budget.CommittedMB, budget.FreeMB)
+	switch {
+	case exists:
+		fmt.Fprintf(stdout, "  conflict:  an app named %q already exists (names are immutable)\n", cfg.Name)
+	case after >= 0:
+		fmt.Fprintf(stdout, "  after:     %d MiB free — the deploy would fit the budget\n", after)
+	default:
+		fmt.Fprintf(stdout, "  after:     over by %d MiB — admission control would refuse the deploy\n", -after)
+	}
+	for _, warn := range warnings {
+		fmt.Fprintf(stdout, "  warning: %s\n", warn)
+	}
 	return 0
 }
 
@@ -879,15 +950,30 @@ type budgetView struct {
 	MinFreeDiskMB int               `json:"min_free_disk_mb"`
 	DiskFreeMB    *int              `json:"disk_free_mb,omitempty"`
 	CPUOvercommit float64           `json:"cpu_overcommit"`
+	DiskForecast  diskForecastView  `json:"disk_forecast"`
 	Apps          []budgetGrantView `json:"apps"`
 }
 
+// diskForecastView mirrors the API's days-until-full estimate.
+type diskForecastView struct {
+	Enough        bool    `json:"enough"`
+	Filling       bool    `json:"filling"`
+	DaysLow       float64 `json:"days_low"`
+	DaysHigh      float64 `json:"days_high"`
+	ThresholdDays int     `json:"threshold_days"`
+	FreeMB        int64   `json:"free_mb"`
+	TotalMB       int64   `json:"total_mb"`
+	Samples       int     `json:"samples"`
+	SpanHours     float64 `json:"span_hours"`
+}
+
 func cmdBudget(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	fs := flagSet("budget", stderr, `usage: tinyship budget [--set-mb N] [--set-min-free-disk N] [--json]
+	fs := flagSet("budget", stderr, `usage: tinyship budget [--set-mb N] [--set-min-free-disk N] [--set-disk-forecast-days N] [--json]
 
 Show the host budget: what apps may claim in RAM in total, what each
-running app currently holds, and the free-disk floor that admission
-enforces before pulling an image. The admission guard enforces granted
+running app currently holds, the free-disk floor that admission
+enforces before pulling an image, and how long the disk has before it
+fills on its current trend. The admission guard enforces granted
 limits, not live usage; a deploy that would push the total past the
 budget is refused at the admission step.
 
@@ -897,9 +983,13 @@ derivation from the host's total RAM).
 --set-min-free-disk N sets the free-disk floor in MiB (256-102400).
 A deploy is refused before pulling when the Docker data filesystem has
 less free space than this.
+
+--set-disk-forecast-days N sets how many days before a full disk the
+forecast warning fires (1-90).
 `)
 	setMB := fs.Int("set-mb", -1, "override the host RAM budget in MiB; 0 restores auto")
 	setDisk := fs.Int("set-min-free-disk", -1, "override the free-disk floor in MiB")
+	setForecast := fs.Int("set-disk-forecast-days", -1, "override the disk forecast warning lead time in days")
 	jsonOut := fs.Bool("json", false, "print machine-readable output")
 	pos, code := parseFlags(fs, args)
 	if code >= 0 {
@@ -912,13 +1002,15 @@ less free space than this.
 	// Sentinels distinguish "not set" from an explicit value. Tracking
 	// the flags lets the API reject an explicit negative value instead
 	// of this command silently treating it as absent.
-	setMBFlag, setDiskFlag := false, false
+	setMBFlag, setDiskFlag, setForecastFlag := false, false, false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "set-mb":
 			setMBFlag = true
 		case "set-min-free-disk":
 			setDiskFlag = true
+		case "set-disk-forecast-days":
+			setForecastFlag = true
 		}
 	})
 
@@ -929,6 +1021,9 @@ less free space than this.
 	}
 	if setDiskFlag {
 		body["min_free_disk_mb"] = *setDisk
+	}
+	if setForecastFlag {
+		body["disk_forecast_days"] = *setForecast
 	}
 	if len(body) > 0 {
 		raw, _ := json.Marshal(body)
@@ -943,6 +1038,9 @@ less free space than this.
 			}
 			if setDiskFlag {
 				fmt.Fprintf(stdout, "Disk floor set to %d MiB\n", *setDisk)
+			}
+			if setForecastFlag {
+				fmt.Fprintf(stdout, "Disk forecast warning set to %d days before full\n", *setForecast)
 			}
 		}
 	}
@@ -970,6 +1068,21 @@ less free space than this.
 	} else {
 		fmt.Fprintf(stdout, "Disk free  unknown on %s\n", worker.DockerDataPath)
 	}
+	switch {
+	case view.DiskForecast.Samples == 0:
+		fmt.Fprintln(stdout, "Forecast   no disk trend samples yet (one per hour from the worker)")
+	case !view.DiskForecast.Enough:
+		fmt.Fprintf(stdout, "Forecast   collecting trend data (%d samples over %.0f h; need a longer span)\n",
+			view.DiskForecast.Samples, view.DiskForecast.SpanHours)
+	case !view.DiskForecast.Filling:
+		fmt.Fprintf(stdout, "Forecast   disk not filling on the current trend (%d samples)\n",
+			view.DiskForecast.Samples)
+	default:
+		fmt.Fprintf(stdout, "Forecast   %.1f–%.1f days until full (threshold %d days, %d samples over %.0f h)\n",
+			view.DiskForecast.DaysLow, view.DiskForecast.DaysHigh,
+			view.DiskForecast.ThresholdDays, view.DiskForecast.Samples,
+			view.DiskForecast.SpanHours)
+	}
 	for _, a := range view.Apps {
 		fmt.Fprintf(stdout, "  %-20s %4d MiB\n", a.Name, a.MemoryMB)
 	}
@@ -978,6 +1091,12 @@ less free space than this.
 	}
 	if view.DiskFreeMB != nil && *view.DiskFreeMB < view.MinFreeDiskMB {
 		fmt.Fprintln(stdout, "Warning: free disk is below the deploy floor; new deploys will be refused until space is freed.")
+	}
+	if view.DiskForecast.Enough && view.DiskForecast.Filling &&
+		view.DiskForecast.DaysLow < float64(view.DiskForecast.ThresholdDays) {
+		fmt.Fprintf(stdout, "Warning: the disk is projected to fill in %.1f–%.1f days (threshold %d); free space or raise the threshold with --set-disk-forecast-days.\n",
+			view.DiskForecast.DaysLow, view.DiskForecast.DaysHigh,
+			view.DiskForecast.ThresholdDays)
 	}
 	return 0
 }

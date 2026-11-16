@@ -84,6 +84,45 @@ func (s *Store) PruneMetricSamples(ctx context.Context, appID string, before tim
 	return nil
 }
 
+// MetricStats is the aggregate one window of an app's history reduces
+// to for right-sizing: the peaks that must never be suggested under,
+// and the span that decides whether the data is mature enough to trust.
+type MetricStats struct {
+	Samples      int
+	PeakMemBytes int64
+	PeakCPU      float64
+	FirstAt      time.Time // zero when the window is empty
+	LastAt       time.Time
+}
+
+// MetricStatsFor aggregates an app's samples at or after since in one
+// query. Rollup rows carry the peak memory of their hour, so MAX over
+// the mixed raw+rollup set is exactly the observed peak.
+func (s *Store) MetricStatsFor(ctx context.Context, appID string, since time.Time) (*MetricStats, error) {
+	var (
+		out     MetricStats
+		n       int
+		peakMem int64
+		first   int64
+		last    int64
+	)
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(MAX(mem_bytes), 0), COALESCE(MAX(cpu_percent), 0),
+		       COALESCE(MIN(ts), 0), COALESCE(MAX(ts), 0)
+		FROM app_metric_samples WHERE app_id = ? AND ts >= ?`,
+		appID, since.UTC().Unix()).Scan(&n, &peakMem, &out.PeakCPU, &first, &last)
+	if err != nil {
+		return nil, fmt.Errorf("store: metric stats: %w", err)
+	}
+	out.Samples = n
+	if n > 0 {
+		out.PeakMemBytes = peakMem
+		out.FirstAt = time.Unix(first, 0).UTC()
+		out.LastAt = time.Unix(last, 0).UTC()
+	}
+	return &out, nil
+}
+
 // ListMetricSamples returns one app's samples at or after since, oldest
 // first: raw rows and hourly rollups together.
 func (s *Store) ListMetricSamples(ctx context.Context, appID string, since time.Time) ([]MetricSample, error) {

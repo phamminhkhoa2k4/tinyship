@@ -57,6 +57,24 @@ func (s *Store) CreateApp(ctx context.Context, in CreateAppInput) (*App, error) 
 	return s.GetAppByID(ctx, id)
 }
 
+// UpdateAppConfig replaces an app's config and bumps its version. The
+// caller validates the config first (appconfig.Validate); the snapshot
+// on each deployment keeps its own copy, so history is unaffected.
+func (s *Store) UpdateAppConfig(ctx context.Context, appID, configJSON string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE apps SET config_json = ?, config_version = config_version + 1,
+		                updated_at = ?
+		WHERE id = ?`,
+		configJSON, time.Now().UTC().UnixMilli(), appID)
+	if err != nil {
+		return fmt.Errorf("store: update app config: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // MarkAppDeleting flags an app as going away: admission and budget
 // math immediately stop counting it, while the teardown job runs.
 func (s *Store) MarkAppDeleting(ctx context.Context, appID string) error {

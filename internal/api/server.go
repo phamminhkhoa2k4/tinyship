@@ -282,6 +282,8 @@ func newMuxWith(s *store.Store, runDir string, logger *slog.Logger, resolve Reso
 	mux.HandleFunc("POST /apps", srv.handleCreateApp)
 	mux.HandleFunc("GET /apps", srv.handleListApps)
 	mux.HandleFunc("GET /apps/{name}", srv.handleShowApp)
+	mux.HandleFunc("GET /apps/{name}/rightsize", srv.handleRightsize)
+	mux.HandleFunc("POST /apps/{name}/rightsize", srv.handleApplyRightsize)
 	mux.HandleFunc("POST /apps/{name}/deploy", srv.handleDeploy)
 	mux.HandleFunc("POST /apps/{name}/rollback", srv.handleRollback)
 	mux.HandleFunc("GET /apps/{name}/deployments", srv.handleListDeployments)
@@ -507,6 +509,36 @@ func (s *server) handleShowApp(w http.ResponseWriter, r *http.Request) {
 
 // --- deploy route --------------------------------------------------------------
 
+// queueDeploy inserts one pending deployment plus its job for the
+// app's current config in a single transaction: the worker claims jobs
+// in a poll loop, and a job visible before its deployment row exists
+// fails the pipeline at its first lookup. Shared by the deploy and
+// rightsize-apply endpoints; the worker revalidates everything.
+func (s *server) queueDeploy(ctx context.Context, app *store.App,
+	cfg *appconfig.Config, force bool) (*store.Deployment, *store.Job, error) {
+	depID := store.NewID()
+	payload := fmt.Sprintf(`{"deployment_id":%q}`, depID)
+	if force {
+		payload = fmt.Sprintf(`{"deployment_id":%q,"force":true}`, depID)
+	}
+	return s.store.CreateDeploymentJob(ctx,
+		store.CreateDeploymentInput{
+			ID:                   depID,
+			AppID:                app.ID,
+			Kind:                 "deploy",
+			ImageRef:             imageRef(cfg),
+			ConfigSnapshotJSON:   app.ConfigJSON,
+			ConfigVersion:        app.ConfigVersion,
+			PreviousDeploymentID: app.CurrentDeploymentID,
+		},
+		store.CreateJobInput{
+			AppID:       &app.ID,
+			Type:        worker.DeployJobType,
+			PayloadJSON: payload,
+			CreatedBy:   "api",
+		})
+}
+
 // handleDeploy queues a deploy job: one pending deployment plus its
 // job, referencing each other. The worker revalidates everything.
 func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
@@ -540,30 +572,10 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	depID := store.NewID()
-	payload := fmt.Sprintf(`{"deployment_id":%q}`, depID)
-	if body.Force {
-		payload = fmt.Sprintf(`{"deployment_id":%q,"force":true}`, depID)
-	}
 	// One transaction: the worker claims jobs in a poll loop, and a
 	// job visible before its deployment row exists fails the pipeline
 	// at its first lookup.
-	dep, job, err := s.store.CreateDeploymentJob(r.Context(),
-		store.CreateDeploymentInput{
-			ID:                   depID,
-			AppID:                app.ID,
-			Kind:                 "deploy",
-			ImageRef:             imageRef(cfg),
-			ConfigSnapshotJSON:   app.ConfigJSON,
-			ConfigVersion:        app.ConfigVersion,
-			PreviousDeploymentID: app.CurrentDeploymentID,
-		},
-		store.CreateJobInput{
-			AppID:       &app.ID,
-			Type:        worker.DeployJobType,
-			PayloadJSON: payload,
-			CreatedBy:   "api",
-		})
+	dep, job, err := s.queueDeploy(r.Context(), app, cfg, body.Force)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "E_INTERNAL", err.Error())
 		return

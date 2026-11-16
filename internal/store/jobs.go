@@ -467,6 +467,20 @@ func (s *Store) CancelRequested(ctx context.Context, jobID string) (bool, error)
 	return req != 0, nil
 }
 
+// HasPendingJob reports whether the app still has work in flight
+// (queued or running). Callers refuse operations that would race the
+// pipeline while a job owns the app.
+func (s *Store) HasPendingJob(ctx context.Context, appID string) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM jobs
+		WHERE app_id = ? AND state IN ('queued', 'running')`, appID).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("store: pending job check: %w", err)
+	}
+	return n > 0, nil
+}
+
 // ReapExpired reclaims jobs whose lease expired: back to queued
 // with backoff, or failed with E_LEASE_EXPIRED when out of attempts.
 // Returns the affected job ids per outcome.

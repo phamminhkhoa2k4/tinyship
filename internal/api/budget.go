@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/tinyship/tinyship/internal/appconfig"
 	"github.com/tinyship/tinyship/internal/store"
@@ -20,16 +21,32 @@ type budgetGrant struct {
 	MemoryMB int    `json:"memory_mb"`
 }
 
+// diskForecastView is the days-until-full estimate for the budget
+// view: a range from two fits, never a point, and never claimed before
+// the trend data is mature.
+type diskForecastView struct {
+	Enough        bool    `json:"enough"`
+	Filling       bool    `json:"filling"`
+	DaysLow       float64 `json:"days_low"`
+	DaysHigh      float64 `json:"days_high"`
+	ThresholdDays int     `json:"threshold_days"`
+	FreeMB        int64   `json:"free_mb"`
+	TotalMB       int64   `json:"total_mb"`
+	Samples       int     `json:"samples"`
+	SpanHours     float64 `json:"span_hours"`
+}
+
 // budgetView is the GET /budget response.
 type budgetView struct {
-	BudgetMB      int           `json:"budget_mb"`
-	BudgetSource  string        `json:"budget_source"` // configured | auto
-	MemTotalMB    int           `json:"mem_total_mb"`
-	CommittedMB   int           `json:"committed_mb"`
-	FreeMB        int           `json:"free_mb"`
-	MinFreeDiskMB int           `json:"min_free_disk_mb"`
-	CPUOvercommit float64       `json:"cpu_overcommit"`
-	Apps          []budgetGrant `json:"apps"`
+	BudgetMB      int              `json:"budget_mb"`
+	BudgetSource  string           `json:"budget_source"` // configured | auto
+	MemTotalMB    int              `json:"mem_total_mb"`
+	CommittedMB   int              `json:"committed_mb"`
+	FreeMB        int              `json:"free_mb"`
+	MinFreeDiskMB int              `json:"min_free_disk_mb"`
+	CPUOvercommit float64          `json:"cpu_overcommit"`
+	DiskForecast  diskForecastView `json:"disk_forecast"`
+	Apps          []budgetGrant    `json:"apps"`
 }
 
 // buildBudgetView computes the view the budget endpoint serves. The
@@ -71,6 +88,28 @@ func buildBudgetView(ctx context.Context, s *store.Store) (*budgetView, error) {
 		view.Apps = append(view.Apps, budgetGrant{Name: a.Name, MemoryMB: mb})
 	}
 	view.FreeMB = budget - view.CommittedMB
+
+	// Disk fill forecast from the worker's hourly samples; the same
+	// numbers drive the disk_forecast alert, so the view and the
+	// notification can never disagree.
+	fcView := diskForecastView{ThresholdDays: settings.DiskForecastDays}
+	samples, err := s.ListDiskSamples(ctx, time.Now().UTC().Add(-worker.ForecastWindow))
+	if err != nil {
+		return nil, err
+	}
+	fcView.Samples = len(samples)
+	if len(samples) > 0 {
+		last := samples[len(samples)-1]
+		fcView.FreeMB = last.FreeMB
+		fcView.TotalMB = last.TotalMB
+		fc := worker.ForecastDisk(samples, last.FreeMB)
+		fcView.Enough = fc.Enough
+		fcView.Filling = fc.Filling
+		fcView.DaysLow = fc.DaysLow
+		fcView.DaysHigh = fc.DaysHigh
+		fcView.SpanHours = fc.Span.Hours()
+	}
+	view.DiskForecast = fcView
 	return view, nil
 }
 
@@ -92,6 +131,8 @@ type setBudgetBody struct {
 	// MinFreeDiskMB is the free-disk floor below which admission
 	// refuses a deploy before pulling.
 	MinFreeDiskMB *int `json:"min_free_disk_mb"`
+	// DiskForecastDays is the lead time at which a filling disk warns.
+	DiskForecastDays *int `json:"disk_forecast_days"`
 }
 
 // handleSetBudget serves POST /budget: the operator's explicit override
@@ -103,9 +144,9 @@ func (s *server) handleSetBudget(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "E_VALIDATION", err.Error())
 		return
 	}
-	if body.BudgetMB == nil && body.MinFreeDiskMB == nil {
+	if body.BudgetMB == nil && body.MinFreeDiskMB == nil && body.DiskForecastDays == nil {
 		writeError(w, http.StatusBadRequest, "E_VALIDATION",
-			"budget_mb or min_free_disk_mb is required")
+			"budget_mb, min_free_disk_mb or disk_forecast_days is required")
 		return
 	}
 	if body.BudgetMB != nil && *body.BudgetMB < 0 {
@@ -119,6 +160,14 @@ func (s *server) handleSetBudget(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "E_VALIDATION", fmt.Sprintf(
 			"min_free_disk_mb must be between %d and %d",
 			store.MinFreeDiskMBFloor, store.MaxFreeDiskMB))
+		return
+	}
+	if body.DiskForecastDays != nil &&
+		(*body.DiskForecastDays < store.DiskForecastDaysFloor ||
+			*body.DiskForecastDays > store.MaxDiskForecastDays) {
+		writeError(w, http.StatusBadRequest, "E_VALIDATION", fmt.Sprintf(
+			"disk_forecast_days must be between %d and %d",
+			store.DiskForecastDaysFloor, store.MaxDiskForecastDays))
 		return
 	}
 	detail := map[string]any{}
@@ -135,6 +184,13 @@ func (s *server) handleSetBudget(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		detail["min_free_disk_mb"] = *body.MinFreeDiskMB
+	}
+	if body.DiskForecastDays != nil {
+		if err := s.store.SetDiskForecastDays(r.Context(), *body.DiskForecastDays); err != nil {
+			writeError(w, http.StatusBadRequest, "E_VALIDATION", err.Error())
+			return
+		}
+		detail["disk_forecast_days"] = *body.DiskForecastDays
 	}
 	if err := s.store.AppendAudit(r.Context(), actorName(r), "budget.set", "host", "",
 		"ok", detail); err != nil {

@@ -59,6 +59,19 @@ func statfsFreeMB(path string) (int, error) {
 	return int(free / (1024 * 1024)), nil
 }
 
+// statfsUsageMB reports free and total space in MiB on the filesystem
+// holding path; the trend sampler records both so a forecast can show
+// what fraction of the disk the estimate is about.
+func statfsUsageMB(path string) (int64, int64, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return 0, 0, fmt.Errorf("statfs %s: %w", path, err)
+	}
+	frsize := int64(st.Frsize)
+	return int64(st.Bavail) * frsize / (1024 * 1024),
+		int64(st.Blocks) * frsize / (1024 * 1024), nil
+}
+
 // numCPU counts logical CPUs visible to the process.
 func numCPU() int { return runtime.NumCPU() }
 

@@ -60,6 +60,8 @@ func RunWithIO(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		return cmdStatus(ctx, args[1:], stdout, stderr)
 	case "stats":
 		return cmdStats(ctx, args[1:], stdout, stderr)
+	case "rightsize":
+		return cmdRightsize(ctx, args[1:], stdout, stderr)
 	case "gc":
 		return cmdGC(ctx, args[1:], stdout, stderr)
 	case "doctor":
@@ -125,6 +127,7 @@ Commands:
   deployments   Show an app's deployment history
   status        Show API health and apps
   stats         Show live RAM, CPU, and OOM counts per app
+  rightsize     Suggest a right-sized memory limit from observed usage
   gc            Remove images outside each app's retention window
   doctor        Diagnose the host: services, docker, files, DNS, drift
   budget        Show or set the host RAM budget

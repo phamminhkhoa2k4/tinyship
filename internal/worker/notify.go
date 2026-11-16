@@ -41,6 +41,17 @@ const (
 	CertReFire   = 7 * 24 * time.Hour
 )
 
+const (
+	// DiskSampleInterval is how often the trend sampler records the
+	// Docker data filesystem; hourly keeps a month of forecast input at
+	// a few hundred rows.
+	DiskSampleInterval = time.Hour
+	// ForecastWindow is how far back the disk forecast fits its trend.
+	ForecastWindow = 30 * 24 * time.Hour
+	// DiskSampleRetain is how long trend samples are kept.
+	DiskSampleRetain = 90 * 24 * time.Hour
+)
+
 // dueBatch bounds how many events one tick processes.
 const dueBatch = 10
 
@@ -54,13 +65,18 @@ type NotifyDispatcher struct {
 	// local proxy). Tests pin them to a scenario.
 	DiskFree   func(path string) (int, error)
 	CertExpiry func(host string) (time.Time, error)
+	// DiskUsage reads free/total for the hourly trend sample; nil
+	// means the real statfs of the Docker data path.
+	DiskUsage func(path string) (int64, int64, error)
 
 	client *http.Client
 
-	// Edge state for the disk check and the cert re-fire pacing;
+	// Edge state for the disk checks and the cert re-fire pacing;
 	// only touched inside the busy-guarded tick goroutine.
-	diskLow       bool
-	lastCertCheck time.Time
+	diskLow            bool
+	diskForecastWarned bool
+	lastCertCheck      time.Time
+	lastDiskSample     time.Time
 }
 
 // NewNotifyDispatcher wires a dispatcher over the store.
@@ -83,6 +99,8 @@ func NewNotifyDispatcher(s *store.Store, log *slog.Logger) *NotifyDispatcher {
 // enqueue), then delivery of due rows.
 func (d *NotifyDispatcher) RunOnce(ctx context.Context) {
 	d.checkDisk(ctx)
+	d.sampleDisk(ctx)
+	d.checkDiskForecast(ctx)
 	d.checkCerts(ctx)
 
 	capFrom := time.Now().UTC().Add(-time.Hour)
@@ -267,6 +285,79 @@ func (d *NotifyDispatcher) checkDisk(ctx context.Context) {
 		}
 	}
 	d.diskLow = low
+}
+
+// sampleDisk records the hourly free/total observation the forecast
+// fits through, and prunes samples past the retention window. Paced by
+// the dispatcher's own clock; a failed read retries next tick.
+func (d *NotifyDispatcher) sampleDisk(ctx context.Context) {
+	if time.Since(d.lastDiskSample) < DiskSampleInterval {
+		return
+	}
+	usage := d.DiskUsage
+	if usage == nil {
+		usage = statfsUsageMB
+	}
+	free, total, err := usage(DockerDataPath)
+	if err != nil {
+		d.Logger.Debug("worker: disk sample probe failed", "err", err)
+		return
+	}
+	now := time.Now().UTC()
+	if err := d.Store.AppendDiskSample(ctx, store.DiskSample{
+		At: now, FreeMB: free, TotalMB: total,
+	}); err != nil {
+		d.Logger.Warn("worker: disk sample append failed", "err", err)
+		return
+	}
+	d.lastDiskSample = now
+	if err := d.Store.PruneDiskSamples(ctx, now.Add(-DiskSampleRetain)); err != nil {
+		d.Logger.Warn("worker: disk sample prune failed", "err", err)
+	}
+}
+
+// checkDiskForecast is the edge-triggered fill-up warning: it fires
+// once when the fitted days-until-full drops under the configured lead
+// time and re-arms only when the estimate climbs back, so a disk that
+// hovers near the threshold warns once instead of every tick. The
+// estimate is a range from two fits (whole window and recent half);
+// the pessimistic bound crossing the threshold is what arms it.
+func (d *NotifyDispatcher) checkDiskForecast(ctx context.Context) {
+	settings, err := d.Store.GetBudgetSettings(ctx)
+	if err != nil {
+		d.Logger.Warn("worker: budget settings unreadable", "err", err)
+		return
+	}
+	samples, err := d.Store.ListDiskSamples(ctx, time.Now().UTC().Add(-ForecastWindow))
+	if err != nil {
+		d.Logger.Warn("worker: list disk samples failed", "err", err)
+		return
+	}
+	if len(samples) == 0 {
+		return
+	}
+	fc := ForecastDisk(samples, samples[len(samples)-1].FreeMB)
+	if !fc.Enough {
+		return
+	}
+	warn := fc.Filling && fc.DaysLow < float64(settings.DiskForecastDays)
+	if warn && !d.diskForecastWarned {
+		if _, err := d.Store.EnqueueNotifyEvent(ctx, store.NotifyEventInput{
+			Type:  "disk_forecast",
+			Title: "Disk projected to fill soon",
+			Detail: map[string]any{
+				"days_low":       round1(fc.DaysLow),
+				"days_high":      round1(fc.DaysHigh),
+				"threshold_days": settings.DiskForecastDays,
+				"free_mb":        samples[len(samples)-1].FreeMB,
+				"total_mb":       samples[len(samples)-1].TotalMB,
+			},
+			DedupKey: "disk_forecast",
+		}); err != nil {
+			d.Logger.Warn("worker: enqueue disk_forecast failed", "err", err)
+		}
+	}
+	d.diskForecastWarned = warn
 }
 
 // checkCerts probes each active hostname's served certificate over a
