@@ -66,6 +66,8 @@ func RunWithIO(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		return cmdDoctor(ctx, args[1:], stdout, stderr)
 	case "budget":
 		return cmdBudget(ctx, args[1:], stdout, stderr)
+	case "notify":
+		return dispatchNotify(ctx, args[1:], stdout, stderr)
 	case "keygen":
 		return cmdKeygen(ctx, args[1:], stdout, stderr)
 	case "help", "--help", "-h":
@@ -126,6 +128,7 @@ Commands:
   gc            Remove images outside each app's retention window
   doctor        Diagnose the host: services, docker, files, DNS, drift
   budget        Show or set the host RAM budget
+  notify        Configure alert channels and send a test notification
   keygen        Generate the secret encryption key pair
   uninstall     Remove the control plane (root; --purge for everything)
   backup        Write one backup file: DB snapshot, config, keys, token (root)

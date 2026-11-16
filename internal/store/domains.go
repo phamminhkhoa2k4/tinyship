@@ -212,6 +212,27 @@ func (s *Store) CountDomainAdds(ctx context.Context, hostname string, since time
 	return n, nil
 }
 
+// ListActiveHostnames returns the distinct hostnames of active domains
+// across all apps — the set the proxy serves a certificate for.
+func (s *Store) ListActiveHostnames(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT hostname FROM domains
+		WHERE status = 'active' ORDER BY hostname`)
+	if err != nil {
+		return nil, fmt.Errorf("store: list active hostnames: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
 // ListRouteRows returns every routable active hostname (domain active ×
 // app's current deployment's host port), sorted for deterministic config
 // generation.

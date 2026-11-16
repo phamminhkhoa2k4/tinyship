@@ -249,6 +249,72 @@ func TestBackupMissingDBFailsClearly(t *testing.T) {
 	}
 }
 
+// A backup that fails on a real host (here: the output directory cannot
+// be created) records a backup_failed event so the operator hears about
+// it from a channel, not from the next manual run.
+func TestBackupFailureQueuesNotification(t *testing.T) {
+	root, db := backupSandbox(t)
+	blocker := filepath.Join(root, "blocker")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, _, stderr := run(t, "backup", "--install-root", root,
+		"-o", filepath.Join(blocker, "out.tsbak"))
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1 (stderr %q)", code, stderr)
+	}
+
+	s, err := store.Open(context.Background(), db)
+	if err != nil {
+		t.Fatalf("open sandbox db: %v", err)
+	}
+	defer s.Close()
+	events, err := s.ListNotifyEvents(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	var failed *store.NotifyEvent
+	for _, ev := range events {
+		if ev.Type == "backup_failed" {
+			failed = ev
+		}
+	}
+	if failed == nil {
+		t.Fatalf("events = %+v, want a backup_failed row", events)
+	}
+	if failed.Status != "pending" {
+		t.Errorf("status = %q, want pending for the dispatcher", failed.Status)
+	}
+	if !strings.Contains(failed.Detail, "blocker") {
+		t.Errorf("detail = %q, want the failing path", failed.Detail)
+	}
+}
+
+// The overwrite refusal is the operator's own choice, not a broken
+// backup: it must stay silent instead of crying wolf on every rerun.
+func TestBackupOverwriteRefusalDoesNotNotify(t *testing.T) {
+	root, db := backupSandbox(t)
+	out := filepath.Join(t.TempDir(), "b.tsbak")
+	if err := os.WriteFile(out, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, _ := run(t, "backup", "--install-root", root, "-o", out); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	s, err := store.Open(context.Background(), db)
+	if err != nil {
+		t.Fatalf("open sandbox db: %v", err)
+	}
+	defer s.Close()
+	events, err := s.ListNotifyEvents(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	if len(events) != 0 {
+		t.Errorf("events = %+v, want none for a refused overwrite", events)
+	}
+}
+
 func TestBackupRealHostRequiresRoot(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("running as root; the refusal cannot trigger")

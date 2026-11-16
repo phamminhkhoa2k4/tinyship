@@ -80,6 +80,9 @@ type Config struct {
 	// RouteSyncInterval is the proxy config convergence period;
 	// default DefaultRouteSyncInterval.
 	RouteSyncInterval time.Duration
+	// NotifyInterval is how often the dispatcher looks for due
+	// notification deliveries; default DefaultNotifyInterval.
+	NotifyInterval time.Duration
 }
 
 // Run starts the worker and blocks until ctx is cancelled. argv is accepted
@@ -110,6 +113,17 @@ func Run(ctx context.Context, argv []string) int {
 			return 1
 		}
 		cfg.RouteSyncInterval = d
+	}
+	// Notification dispatch period, same reasoning as route sync: a
+	// test host ticks fast to observe delivery without waiting.
+	if v := os.Getenv("TINYSHIP_NOTIFY_TICK"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			logger.Error("worker: TINYSHIP_NOTIFY_TICK must be a positive Go duration",
+				"value", v)
+			return 1
+		}
+		cfg.NotifyInterval = d
 	}
 	if host, err := os.Hostname(); err == nil {
 		cfg.WorkerID = fmt.Sprintf("%s-%d", host, os.Getpid())
@@ -192,6 +206,9 @@ func RunStore(ctx context.Context, s *store.Store, cfg Config) error {
 	}
 	if cfg.ReapInterval <= 0 {
 		cfg.ReapInterval = store.ReapEvery
+	}
+	if cfg.NotifyInterval <= 0 {
+		cfg.NotifyInterval = DefaultNotifyInterval
 	}
 	if cfg.StatsInterval <= 0 {
 		cfg.StatsInterval = StatsInterval
@@ -308,10 +325,14 @@ func RunStore(ctx context.Context, s *store.Store, cfg Config) error {
 		defer tick.Stop()
 		routeSync = tick.C
 	}
+	notifyTick := time.NewTicker(cfg.NotifyInterval)
+	defer notifyTick.Stop()
+	notifyDisp := NewNotifyDispatcher(s, logger)
 
 	// A one-shot daemon read waits for a sampling window, so run periodic
 	// samples off the job loop; a deploy claim must not queue behind stats.
 	var statsBusy atomic.Bool
+	var notifyBusy atomic.Bool
 
 	for {
 		select {
@@ -325,6 +346,17 @@ func RunStore(ctx context.Context, s *store.Store, cfg Config) error {
 						// A missed sample only delays the next observation.
 						logger.Warn("worker: stats sample failed", "err", err)
 					}
+				}()
+			}
+		case <-notifyTick.C:
+			// Delivery talks to operator-chosen endpoints: run it off
+			// the job loop so a slow receiver never delays a deploy
+			// claim, and skip the tick while a previous one is still
+			// sending (the queue keeps the work for the next round).
+			if notifyBusy.CompareAndSwap(false, true) {
+				go func() {
+					defer notifyBusy.Store(false)
+					notifyDisp.RunOnce(ctx)
 				}()
 			}
 		case <-collect:

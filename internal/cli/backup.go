@@ -146,6 +146,7 @@ passphrase is read from stdin so it never lands in shell history.
 	files, schema, missing, err := collectBackupFiles(ctx, root)
 	if err != nil {
 		fmt.Fprintf(stderr, "tinyship backup: %v\n", err)
+		enqueueBackupFailed(ctx, dbPath, err.Error())
 		return 1
 	}
 
@@ -156,6 +157,7 @@ passphrase is read from stdin so it never lands in shell history.
 	}
 	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 		fmt.Fprintf(stderr, "tinyship backup: create backup directory: %v\n", err)
+		enqueueBackupFailed(ctx, dbPath, err.Error())
 		return 1
 	}
 	f, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
@@ -165,6 +167,7 @@ passphrase is read from stdin so it never lands in shell history.
 			return 1
 		}
 		fmt.Fprintf(stderr, "tinyship backup: create %s: %v\n", target, err)
+		enqueueBackupFailed(ctx, dbPath, err.Error())
 		return 1
 	}
 	manifest, err := writeBackupArchive(f, files, schema, passphrase)
@@ -172,19 +175,42 @@ passphrase is read from stdin so it never lands in shell history.
 		f.Close()
 		os.Remove(target)
 		fmt.Fprintf(stderr, "tinyship backup: %v\n", err)
+		enqueueBackupFailed(ctx, dbPath, err.Error())
 		return 1
 	}
 	if err := f.Close(); err != nil {
 		fmt.Fprintf(stderr, "tinyship backup: %v\n", err)
+		enqueueBackupFailed(ctx, dbPath, err.Error())
 		return 1
 	}
 	// umask can loosen the create mode; a file holding the secret key
 	// must stay owner-only.
 	if err := os.Chmod(target, 0o600); err != nil {
 		fmt.Fprintf(stderr, "tinyship backup: chmod: %v\n", err)
+		enqueueBackupFailed(ctx, dbPath, err.Error())
 		return 1
 	}
 	return reportBackup(target, manifest, missing, *jsonOut, stdout, stderr)
+}
+
+// enqueueBackupFailed records a backup_failed notification directly in
+// the database — the CLI has no worker to talk to, and the dispatcher
+// picks the row up on its next tick. Entirely best-effort: a missing or
+// unwritable database must not add a second failure on top of the
+// first, and OpenPlain keeps this from migrating the state the backup
+// is preserving.
+func enqueueBackupFailed(ctx context.Context, dbPath, cause string) {
+	s, err := store.OpenPlain(dbPath)
+	if err != nil {
+		return
+	}
+	defer s.Close()
+	_, _ = s.EnqueueNotifyEvent(ctx, store.NotifyEventInput{
+		Type:     "backup_failed",
+		Title:    "Backup failed",
+		Detail:   map[string]any{"error": cause},
+		DedupKey: "backup_failed",
+	})
 }
 
 // collectBackupFiles gathers the archive members for a backup of the

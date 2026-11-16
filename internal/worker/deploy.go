@@ -228,6 +228,15 @@ func (p *Deployer) run(ctx context.Context, job *store.Job) error {
 	err = p.pipeline(ctx, d, log)
 	if err == nil {
 		log.Info("deploy: succeeded")
+		if d.dep.Kind == "rollback" {
+			p.enqueueNotify(ctx, store.NotifyEventInput{
+				Type:     "rollback",
+				AppName:  d.app.Name,
+				Title:    "Rolled back to a previous release",
+				Detail:   map[string]any{"deployment": d.dep.ID, "auto": false},
+				DedupKey: "rollback:" + d.dep.ID,
+			})
+		}
 		return nil
 	}
 	if Retryable(err) && job.Attempts < job.MaxAttempts {
@@ -243,6 +252,18 @@ func (p *Deployer) run(ctx context.Context, job *store.Job) error {
 	if failErr := p.Store.FailDeployment(ctx, dep.ID, se.step, se.code, se.Error()); failErr != nil {
 		log.Error("deploy: could not record failure", "err", failErr)
 	}
+	// Best-effort notification, after the failure is durable: a queue
+	// problem must never turn a recorded failure into a crash loop.
+	p.enqueueNotify(ctx, store.NotifyEventInput{
+		Type:    "deploy_failed",
+		AppName: d.app.Name,
+		Title:   "Deploy failed",
+		Detail: map[string]any{
+			"deployment": dep.ID, "step": se.step, "code": se.code,
+			"error": se.Error(), "kind": dep.Kind,
+		},
+		DedupKey: "deploy_failed:" + dep.ID,
+	})
 	p.recover(ctx, d, log, se)
 	return err
 }
@@ -886,6 +907,15 @@ func (p *Deployer) stepFinalize(ctx context.Context, d *deployRun) (any, error) 
 // running and before the new one disappears, so no request is ever sent
 // to a removed container. A failed restart is audited as
 // needs_attention.
+// enqueueNotify records one notification best-effort: a queue problem
+// is logged and swallowed so it can never affect the deploy outcome.
+func (p *Deployer) enqueueNotify(ctx context.Context, in store.NotifyEventInput) {
+	if _, err := p.Store.EnqueueNotifyEvent(ctx, in); err != nil {
+		p.Logger.Warn("deploy: enqueue notification failed",
+			"type", in.Type, "err", err)
+	}
+}
+
 func (p *Deployer) recover(ctx context.Context, d *deployRun, log *slog.Logger, se *stepError) {
 	if d.oldStopped && d.oldContainerID != "" {
 		if err := p.Docker.StartContainer(ctx, d.oldContainerID); err != nil {

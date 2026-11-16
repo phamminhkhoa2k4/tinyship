@@ -54,6 +54,7 @@ type StatsStore interface {
 	AppendMetricSample(ctx context.Context, in store.MetricSample) error
 	RollupMetricSamples(ctx context.Context, rawBefore time.Time) error
 	PruneMetricSamples(ctx context.Context, appID string, before time.Time) error
+	EnqueueNotifyEvent(ctx context.Context, in store.NotifyEventInput) (int64, error)
 }
 
 // StatsSampler measures managed containers and persists the observations.
@@ -168,6 +169,29 @@ func (s *StatsSampler) Sample(ctx context.Context) ([]AppStats, error) {
 		}
 		if st.sampled {
 			s.recordMetric(ctx, app, st, now)
+		}
+		// A rising OOM counter is the event: one notification per
+		// observed kill, never one per sample of a killed container.
+		prevKills := 0
+		if prev := previous[app.ID]; prev != nil {
+			prevKills = prev.OOMKillCount
+		}
+		if st.OOMKillCount > prevKills {
+			if _, err := s.Store.EnqueueNotifyEvent(ctx, store.NotifyEventInput{
+				Type:    "oom",
+				AppName: app.Name,
+				Title:   "App killed out of memory",
+				Detail: map[string]any{
+					"oom_count": st.OOMKillCount,
+					"limit_mb":  st.MemLimitMB,
+					"usage_mb":  st.MemUsageMB,
+					"container": st.State,
+				},
+				DedupKey: "oom:" + app.ID,
+			}); err != nil {
+				s.Logger.Warn("worker: enqueue oom notification failed",
+					"app", app.Name, "err", err)
+			}
 		}
 	}
 	s.sweepMetrics(ctx, apps, now)
