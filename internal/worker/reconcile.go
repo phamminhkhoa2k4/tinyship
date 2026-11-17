@@ -61,6 +61,7 @@ func logReconcileReport(ctx context.Context, s *store.Store, running map[string]
 		"up_to_date", joinOrDash(rep.UpToDate),
 		"need_deploy", joinOrDash(rep.NeedDeploy),
 		"stopped", joinOrDash(rep.Stopped),
+		"hibernating", joinOrDash(rep.Hibernating),
 		"unknown_running", joinOrDash(rep.UnknownRunning),
 	}
 	if rep.Drift() {

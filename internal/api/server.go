@@ -285,6 +285,7 @@ func newMuxWith(s *store.Store, runDir string, logger *slog.Logger, resolve Reso
 	mux.HandleFunc("GET /apps/{name}/rightsize", srv.handleRightsize)
 	mux.HandleFunc("POST /apps/{name}/rightsize", srv.handleApplyRightsize)
 	mux.HandleFunc("POST /apps/{name}/deploy", srv.handleDeploy)
+	mux.HandleFunc("POST /apps/{name}/hibernate", srv.handleHibernate)
 	mux.HandleFunc("POST /apps/{name}/rollback", srv.handleRollback)
 	mux.HandleFunc("GET /apps/{name}/deployments", srv.handleListDeployments)
 	mux.HandleFunc("GET /apps/{name}/logs", srv.handleLogs)
@@ -360,15 +361,19 @@ type appDTO struct {
 	Port                int             `json:"port,omitempty"`
 	Config              json.RawMessage `json:"config,omitempty"`
 	CurrentDeploymentID *string         `json:"current_deployment_id,omitempty"`
-	Warnings            []string        `json:"warnings,omitempty"`
-	CreatedAt           time.Time       `json:"created_at"`
-	UpdatedAt           time.Time       `json:"updated_at"`
+	// HibernateState is the sleep/wake machine's position; '' means
+	// hibernation is off for the app (counted awake).
+	HibernateState string    `json:"hibernate_state"`
+	Warnings       []string  `json:"warnings,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 func appToDTO(a *store.App, withConfig bool, warnings []string) appDTO {
 	d := appDTO{
 		ID: a.ID, Name: a.Name, DesiredState: a.DesiredState,
 		CurrentDeploymentID: a.CurrentDeploymentID,
+		HibernateState:      a.HibernateState,
 		Warnings:            warnings,
 		CreatedAt:           a.CreatedAt, UpdatedAt: a.UpdatedAt,
 	}

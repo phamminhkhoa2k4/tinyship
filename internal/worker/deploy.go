@@ -68,6 +68,11 @@ type Deployer struct {
 	// Caddy applies generated proxy config; nil means no route engine
 	// is configured and an app with active domains fails loudly.
 	Caddy Caddy
+	// Relay restarts an app's idle clock when a deploy finalizes, so
+	// the sleep sweep cannot stop the new container before route-sync
+	// has moved the route back onto the relay. nil (no wake path
+	// configured, most tests) skips the touch.
+	Relay *Relay
 	// Probe performs the final check; nil means DefaultProbe.
 	Probe ProbeFunc
 	// Host facts the admission guard reads; nil means the real readers
@@ -549,14 +554,25 @@ func (p *Deployer) stepAdmission(ctx context.Context, d *deployRun) (any, error)
 		budgetSource = "auto"
 	}
 
-	// Committed memory: every other running app's granted limit. A
-	// corrupt stored config must not silently vanish from the sum, so
-	// it counts at the default limit.
+	// The committed ceiling is tier two: granted limits (awake and
+	// sleeping alike) may never pass it, so even if every hibernating
+	// app woke at once the host fits inside physical RAM. It sits above
+	// the awake tier, which is what lets hibernation host more apps
+	// than would fit awake at once.
+	ceilingMB := CeilingMB(memTotal)
+
+	// Both tiers run under the shared admission lock: a wake recorded
+	// between this read and this decision must be visible in the sums,
+	// or a deploy and a wake could each pass on a count of the other.
+	// A corrupt stored config must not silently vanish from either
+	// sum, so it counts at the default limit.
+	admissionMu.Lock()
 	running, err := p.Store.ListRunningApps(ctx)
 	if err != nil {
+		admissionMu.Unlock()
 		return nil, &RetryableError{err}
 	}
-	committed, committedCPU := 0, 0
+	committed, awake, awakeCPU := 0, 0, 0
 	for _, a := range running {
 		if a.ID == d.app.ID {
 			continue
@@ -566,46 +582,69 @@ func (p *Deployer) stepAdmission(ctx context.Context, d *deployRun) (any, error)
 			mb, cpu = otherCfg.Resources.MemoryMB, otherCfg.Resources.CPUMillis
 		}
 		committed += mb
-		committedCPU += cpu
+		if a.HibernateState != store.HibernateSleeping {
+			awake += mb
+			// Only an awake app exerts CPU pressure; sleeping grants
+			// are counted in committed, not here.
+			awakeCPU += cpu
+		}
 	}
 
 	newMB := d.cfg.Resources.MemoryMB
-	// Peak accounting: start-first runs old and new together, so the
-	// budget must fit both. The old limit is the snapshot of the
+	// Peak accounting: start-first runs old and new together, so both
+	// tiers must fit the peak. The old limit is the snapshot of the
 	// deployment being replaced; no old container, no peak.
 	needed := newMB
 	if d.strategy == "start-first" && d.oldContainerID != "" {
 		needed = d.oldMemMB + newMB
 	}
-	if d.strategyAuto && committed+needed > budgetMB && committed+newMB <= budgetMB {
+	if d.strategyAuto &&
+		(awake+needed > budgetMB || committed+needed > ceilingMB) &&
+		awake+newMB <= budgetMB && committed+newMB <= ceilingMB {
 		d.strategy = "stop-first"
 		needed = newMB
 		if err := p.Store.SetDeploymentStrategy(ctx, d.dep.ID, d.strategy); err != nil {
+			admissionMu.Unlock()
 			return nil, &RetryableError{err}
 		}
 	}
 
 	warnings := []string{}
-	over := committed + needed - budgetMB
+	overAwake := awake + needed - budgetMB
+	overCeiling := committed + needed - ceilingMB
+	over := overAwake
+	if overCeiling > over {
+		over = overCeiling
+	}
 	if over > 0 {
 		if !d.force {
+			admissionMu.Unlock()
+			binding := "awake RAM budget"
+			if overCeiling > overAwake {
+				binding = "committed ceiling"
+			}
 			return nil, &pipelineError{code: "E_BUDGET_EXCEEDED", err: fmt.Errorf(
-				"host RAM budget exceeded: %d MiB committed + %d MiB needed = %d MiB, "+
-					"budget %d MiB (%s), over by %d MiB; lower resources.memory_mb, "+
-					"stop or delete another app, or redeploy with --force",
-				committed, needed, committed+needed, budgetMB, budgetSource, over)}
+				"host RAM guard exceeded: %d MiB awake + %d MiB needed = %d MiB vs %s "+
+					"%d MiB (%s), %d MiB committed + %d MiB needed vs ceiling %d MiB, "+
+					"over by %d MiB; lower resources.memory_mb, stop or delete another "+
+					"app, or redeploy with --force",
+				awake, needed, awake+needed, binding, budgetMB, budgetSource,
+				committed, needed, ceilingMB, over)}
 		}
-		// Force admits past the RAM budget only; the disk floor and
+		// Force admits past the RAM guard only; the disk floor and
 		// the security policy still apply below and in later steps.
 		warnings = append(warnings, "W_BUDGET_FORCED")
 		if err := p.Store.AppendAudit(ctx, p.Actor, "admission.force", "deployment",
 			d.dep.ID, "forced", map[string]any{
 				"app": d.app.Name, "budget_mb": budgetMB, "budget_source": budgetSource,
+				"ceiling_mb": ceilingMB, "awake_mb": awake,
 				"committed_mb": committed, "requested_mb": needed, "over_by_mb": over,
 			}); err != nil {
+			admissionMu.Unlock()
 			return nil, &RetryableError{err}
 		}
 	}
+	admissionMu.Unlock()
 
 	// Disk floor: refuse to fill the disk that holds Docker's data.
 	// This is never bypassed by force.
@@ -620,8 +659,9 @@ func (p *Deployer) stepAdmission(ctx context.Context, d *deployRun) (any, error)
 			free, budget.MinFreeDiskMB)}
 	}
 
-	// CPU overcommit is a warning, never a rejection.
-	totalCPU := committedCPU + d.cfg.Resources.CPUMillis
+	// CPU overcommit is a warning, never a rejection. It reads the
+	// awake tier: a sleeping app cannot be throttling anything.
+	totalCPU := awakeCPU + d.cfg.Resources.CPUMillis
 	if float64(totalCPU) > float64(p.numCPUs())*1000*budget.CPUOvercommit {
 		warnings = append(warnings, "W_CPU_OVERCOMMIT")
 	}
@@ -637,6 +677,7 @@ func (p *Deployer) stepAdmission(ctx context.Context, d *deployRun) (any, error)
 	return map[string]any{
 		"host_port": port, "memory_mb": newMB, "strategy": d.strategy,
 		"budget_mb": budgetMB, "budget_source": budgetSource,
+		"ceiling_mb": ceilingMB, "awake_mb": awake,
 		"committed_mb": committed, "needed_mb": needed,
 		"disk_free_mb": free, "warnings": warnings,
 	}, nil
@@ -894,6 +935,14 @@ func (p *Deployer) stepRetireOld(ctx context.Context, d *deployRun, log *slog.Lo
 func (p *Deployer) stepFinalize(ctx context.Context, d *deployRun) (any, error) {
 	if err := p.Store.SucceedDeployment(ctx, d.app.ID, d.dep.ID); err != nil {
 		return nil, &RetryableError{err}
+	}
+	if p.Relay != nil && d.cfg != nil && d.cfg.HibernateEnabled() {
+		// The proxy dials this run's container directly until the next
+		// route-sync tick rewrites the route to the wake relay. The
+		// idle clock restarts here so the sweep cannot sleep the app
+		// inside that gap: one sync period is shorter than the
+		// shortest idle window, so the route always converges first.
+		p.Relay.touch(d.app.ID)
 	}
 	return map[string]any{"current": d.dep.ID}, nil
 }

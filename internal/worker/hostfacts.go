@@ -94,3 +94,19 @@ func AutoBudgetMB(memTotal int) int {
 	}
 	return b
 }
+
+// CeilingMB is the second admission tier: the sum of granted limits —
+// awake and sleeping apps alike — may never pass this, so even if
+// every hibernating app woke at once the grants fit inside physical
+// RAM with 512 MiB left for the OS, the proxy, and TinyShip itself.
+// The ceiling sits above the awake tier (AutoBudgetMB), which is what
+// lets hibernation host more apps than would fit awake at once; on a
+// host where the two coincide it degenerates to the single awake
+// budget, still correct, just no extra app headroom.
+func CeilingMB(memTotal int) int {
+	c := memTotal - 512
+	if c < 0 {
+		return 0
+	}
+	return c
+}

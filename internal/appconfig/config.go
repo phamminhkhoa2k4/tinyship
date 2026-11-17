@@ -43,12 +43,21 @@ const (
 	MaxMetricsRetentionDays     = 365
 	MinKeepReleases             = 1
 	MaxKeepReleases             = 50
-	MinMemoryMB                 = 32
-	MinCPUMillis                = 50
-	MinPidsLimit                = 16
-	MaxPidsLimit                = 4096
-	AllowedCapAdd               = "NET_BIND_SERVICE" // the one capability the config may add
-	TINYSHIPEnvPrefix           = "TINYSHIP_"
+	// hibernate defaults: off, idle for 10 minutes before the
+	// container is stopped, and a 30 s wake budget (the spike measured
+	// the slowest cold start at 1.74 s, so the budget has headroom).
+	DefaultHibernateIdleTimeoutS = 600
+	DefaultHibernateWakeTimeoutS = 30
+	MinHibernateIdleTimeoutS     = 60
+	MaxHibernateIdleTimeoutS     = 86400
+	MinHibernateWakeTimeoutS     = 5
+	MaxHibernateWakeTimeoutS     = 120
+	MinMemoryMB                  = 32
+	MinCPUMillis                 = 50
+	MinPidsLimit                 = 16
+	MaxPidsLimit                 = 4096
+	AllowedCapAdd                = "NET_BIND_SERVICE" // the one capability the config may add
+	TINYSHIPEnvPrefix            = "TINYSHIP_"
 )
 
 var (
@@ -87,6 +96,9 @@ type Config struct {
 	// Metrics bounds resource-sample collection for this app; absent
 	// values read as the documented default (on, every 30s, 30 days).
 	Metrics Metrics `json:"metrics,omitempty"`
+	// Hibernate stops this app's container after idle_timeout_s without
+	// requests and wakes it on the next one; absent reads as off.
+	Hibernate Hibernate `json:"hibernate,omitempty"`
 }
 
 // Health describes the host-run health probe.
@@ -145,6 +157,44 @@ func (c *Config) MetricsRetention() time.Duration {
 		d = DefaultMetricsRetentionDays
 	}
 	return time.Duration(d) * 24 * time.Hour
+}
+
+// Hibernate stops an idle app's container and wakes it on the next
+// request. Long-lived WebSocket/SSE connections, workers without an
+// HTTP listener, and internal cron apps do not fit it (the wake
+// relay only sees ordinary HTTP requests).
+type Hibernate struct {
+	// Enabled is a pointer so JSON can distinguish "absent" (default
+	// off) from an explicit value.
+	Enabled      *bool `json:"enabled,omitempty"`
+	IdleTimeoutS int   `json:"idle_timeout_s,omitempty"`
+	WakeTimeoutS int   `json:"wake_timeout_s,omitempty"`
+}
+
+// HibernateEnabled reports whether this config hibernates: an absent
+// field (or configs written before the field existed) reads as the
+// documented default, off.
+func (c *Config) HibernateEnabled() bool {
+	return c.Hibernate.Enabled != nil && *c.Hibernate.Enabled
+}
+
+// HibernateIdleTimeout is the idle window before the container stops.
+func (c *Config) HibernateIdleTimeout() time.Duration {
+	s := c.Hibernate.IdleTimeoutS
+	if s == 0 {
+		s = DefaultHibernateIdleTimeoutS
+	}
+	return time.Duration(s) * time.Second
+}
+
+// HibernateWakeTimeout is the configured deadline for holding a
+// request while the app starts (503 + Retry-After once it passes).
+func (c *Config) HibernateWakeTimeout() time.Duration {
+	s := c.Hibernate.WakeTimeoutS
+	if s == 0 {
+		s = DefaultHibernateWakeTimeoutS
+	}
+	return time.Duration(s) * time.Second
 }
 
 // Tmpfs is an in-memory mount for read-only-rootfs apps.
@@ -346,6 +396,23 @@ func Validate(c *Config) (warnings []string, err error) {
 	if c.Metrics.RetentionDays < MinMetricsRetentionDays || c.Metrics.RetentionDays > MaxMetricsRetentionDays {
 		add("metrics.retention_days: %d out of range %d-%d",
 			c.Metrics.RetentionDays, MinMetricsRetentionDays, MaxMetricsRetentionDays)
+	}
+
+	// hibernate: off by default; ranges materialize only so a stored
+	// config carries the value the worker will enforce.
+	if c.Hibernate.IdleTimeoutS == 0 {
+		c.Hibernate.IdleTimeoutS = DefaultHibernateIdleTimeoutS
+	}
+	if c.Hibernate.IdleTimeoutS < MinHibernateIdleTimeoutS || c.Hibernate.IdleTimeoutS > MaxHibernateIdleTimeoutS {
+		add("hibernate.idle_timeout_s: %d out of range %d-%d",
+			c.Hibernate.IdleTimeoutS, MinHibernateIdleTimeoutS, MaxHibernateIdleTimeoutS)
+	}
+	if c.Hibernate.WakeTimeoutS == 0 {
+		c.Hibernate.WakeTimeoutS = DefaultHibernateWakeTimeoutS
+	}
+	if c.Hibernate.WakeTimeoutS < MinHibernateWakeTimeoutS || c.Hibernate.WakeTimeoutS > MaxHibernateWakeTimeoutS {
+		add("hibernate.wake_timeout_s: %d out of range %d-%d",
+			c.Hibernate.WakeTimeoutS, MinHibernateWakeTimeoutS, MaxHibernateWakeTimeoutS)
 	}
 
 	// defaults

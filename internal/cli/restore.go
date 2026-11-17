@@ -453,11 +453,13 @@ func reportReconcile(ctx context.Context, dbPath string, stdout, stderr io.Write
 	// and the status output; only this rendering is restore-specific.
 	rep := reconcile.Compare(reconcile.FromStore(apps), running)
 	upToDate, needDeploy, stopped, orphans := rep.UpToDate, rep.NeedDeploy, rep.Stopped, rep.UnknownRunning
+	hibernating := rep.Hibernating
 
 	if jsonOut {
-		fmt.Fprintf(stdout, "{\"reconcile\":\"done\",\"up_to_date\":%q,\"need_deploy\":%q,\"stopped\":%q,\"unknown_running\":%q}\n",
+		fmt.Fprintf(stdout, "{\"reconcile\":\"done\",\"up_to_date\":%q,\"need_deploy\":%q,\"stopped\":%q,\"hibernating\":%q,\"unknown_running\":%q}\n",
 			strings.Join(upToDate, ","), strings.Join(needDeploy, ","),
-			strings.Join(stopped, ","), strings.Join(orphans, ","))
+			strings.Join(stopped, ","), strings.Join(hibernating, ","),
+			strings.Join(orphans, ","))
 		return 0
 	}
 	fmt.Fprintln(stdout, "Reconcile report (read-only; nothing was restarted or removed):")
@@ -470,6 +472,10 @@ func reportReconcile(ctx context.Context, dbPath string, stdout, stderr io.Write
 	}
 	if len(stopped) > 0 {
 		fmt.Fprintf(stdout, "  stopped by config:  %s\n", strings.Join(stopped, ", "))
+	}
+	if len(hibernating) > 0 {
+		fmt.Fprintf(stdout, "  hibernating:        %s\n", strings.Join(hibernating, ", "))
+		fmt.Fprintln(stdout, "    each wakes on its next request; no deploy is needed")
 	}
 	if len(orphans) > 0 {
 		fmt.Fprintf(stdout, "  running but unknown to the restored database: %s\n", strings.Join(orphans, ", "))

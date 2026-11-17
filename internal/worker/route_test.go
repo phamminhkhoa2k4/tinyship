@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/tinyship/tinyship/internal/caddy"
+	"github.com/tinyship/tinyship/internal/policy"
 	"github.com/tinyship/tinyship/internal/store"
 )
 
@@ -565,5 +567,218 @@ func moveCurrentDeployment(t *testing.T, s *store.Store, app *store.App, port in
 	dep := makeDeployment(t, s, app.ID, port)
 	if err := s.SucceedDeployment(ctx, app.ID, dep); err != nil {
 		t.Fatalf("succeed moved deployment: %v", err)
+	}
+}
+
+// --- hibernation routing ------------------------------------------------------
+
+func TestRegenerateRoutesPointsHibernatingAppsAtTheRelay(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	fc := &fakeCaddy{}
+	log := slog.New(slog.DiscardHandler)
+
+	// A plain app keeps its container port.
+	createRoutedApp(t, s, "plain", "plain.example.com", 20001)
+
+	// A hibernating app is routed at the relay, awake or asleep, so
+	// no proxy reconfiguration is ever needed to wake it.
+	hib, err := s.CreateApp(ctx, store.CreateAppInput{
+		Name: "hib", ConfigJSON: hibConfig("hib", 128, 60, 30), Actor: "cli",
+	})
+	if err != nil {
+		t.Fatalf("create hibernating app: %v", err)
+	}
+	dep := makeDeployment(t, s, hib.ID, 20002)
+	if err := s.SucceedDeployment(ctx, hib.ID, dep); err != nil {
+		t.Fatalf("succeed deployment: %v", err)
+	}
+	dom, _, err := s.AddDomain(ctx, hib.ID, "hib.example.com")
+	if err != nil {
+		t.Fatalf("add domain: %v", err)
+	}
+	if err := s.SetDomainStatus(ctx, dom.ID, store.DomainActive); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+
+	if err := RegenerateRoutes(ctx, s, fc, log); err != nil {
+		t.Fatalf("regenerate: %v", err)
+	}
+	body := routeBody(t, fc.last())
+	if !strings.Contains(body, "127.0.0.1:"+strconv.Itoa(policy.RelayPort)) {
+		t.Errorf("config must dial the relay for the hibernating app: %s", body)
+	}
+	if !strings.Contains(body, "127.0.0.1:20001") {
+		t.Errorf("config must keep the plain app on its port: %s", body)
+	}
+	if strings.Contains(body, "127.0.0.1:20002") {
+		t.Errorf("config must not dial the hibernating app's own port: %s", body)
+	}
+}
+
+func TestRelayTargetsKeepAnArmedMachineOnTheRelay(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	// Hibernation on: the route must point at the relay.
+	on, err := s.CreateApp(ctx, store.CreateAppInput{
+		Name: "on-app", ConfigJSON: hibConfig("on-app", 128, 60, 30), Actor: "cli",
+	})
+	if err != nil {
+		t.Fatalf("create app: %v", err)
+	}
+	// Hibernation off and never slept: the container serves directly.
+	off, err := s.CreateApp(ctx, store.CreateAppInput{
+		Name: "off-app", ConfigJSON: `{"name":"off-app","image":"nginx"}`, Actor: "cli",
+	})
+	if err != nil {
+		t.Fatalf("create app: %v", err)
+	}
+	// Turned off while asleep: the machine is still armed, and
+	// dropping the relay route would strand the stopped container.
+	stranded, err := s.CreateApp(ctx, store.CreateAppInput{
+		Name: "stranded", ConfigJSON: `{"name":"stranded","image":"nginx"}`, Actor: "cli",
+	})
+	if err != nil {
+		t.Fatalf("create app: %v", err)
+	}
+	if err := s.SetHibernateState(ctx, stranded.ID, store.HibernateSleeping); err != nil {
+		t.Fatalf("arm machine: %v", err)
+	}
+
+	targets, err := relayTargets(ctx, s)
+	if err != nil {
+		t.Fatalf("relay targets: %v", err)
+	}
+	if !targets[on.ID] {
+		t.Error("an app with hibernation on must be relay-routed")
+	}
+	if targets[off.ID] {
+		t.Error("an app without hibernation must keep its container port")
+	}
+	if !targets[stranded.ID] {
+		t.Error("an armed machine keeps the relay route until it retires")
+	}
+}
+
+func TestWithRelayRewritesOnlyTargetUpstreams(t *testing.T) {
+	rows := []store.RouteRow{
+		{DomainID: "d1", AppID: "a1", Hostname: "one.example.com", HostPort: 20001},
+		{DomainID: "d2", AppID: "a2", Hostname: "two.example.com", HostPort: 20002},
+	}
+	out := withRelay(rows, map[string]bool{"a1": true})
+
+	if out[0].HostPort != policy.RelayPort {
+		t.Errorf("target upstream = %d, want the relay %d", out[0].HostPort, policy.RelayPort)
+	}
+	if out[1].HostPort != 20002 {
+		t.Errorf("other upstream = %d, want its own port", out[1].HostPort)
+	}
+	if rows[0].HostPort != 20001 {
+		t.Error("the caller's rows must not be rewritten in place")
+	}
+	// With no targets the rows pass through untouched.
+	if same := withRelay(rows, nil); len(same) != 2 || same[0].HostPort != 20001 {
+		t.Errorf("no targets must leave the rows alone: %+v", same)
+	}
+}
+
+// --- deploy ↔ relay -----------------------------------------------------------
+
+// upstreamDial reads where the proxy would dial for a hostname in an
+// applied config, exactly as the final check's probe would reach it.
+func upstreamDial(t *testing.T, server map[string]any, host string) string {
+	t.Helper()
+	routes, _ := server["routes"].([]any)
+	for _, raw := range routes {
+		route, _ := raw.(map[string]any)
+		matches, _ := route["match"].([]any)
+		for _, rawM := range matches {
+			m, _ := rawM.(map[string]any)
+			var hosts []string
+			switch h := m["host"].(type) {
+			case []string:
+				hosts = h
+			case []any:
+				for _, v := range h {
+					if s, ok := v.(string); ok {
+						hosts = append(hosts, s)
+					}
+				}
+			}
+			for _, h := range hosts {
+				if h != host {
+					continue
+				}
+				handles, _ := route["handle"].([]any)
+				for _, rawH := range handles {
+					h, _ := rawH.(map[string]any)
+					ups, _ := h["upstreams"].([]any)
+					for _, rawU := range ups {
+						u, _ := rawU.(map[string]any)
+						if dial, ok := u["dial"].(string); ok {
+							return dial
+						}
+					}
+				}
+			}
+		}
+	}
+	t.Fatalf("no route for %q in applied config %s", host, routeBody(t, server))
+	return ""
+}
+
+// TestDeployOfAHibernatingAppProbesTheContainerNotTheRelay: the deploy
+// job is in flight while final_check probes through the proxy, and the
+// relay answers every request during a job with 503. The route switch
+// must therefore aim this app at the new container for the whole
+// pipeline — whatever its hibernation position — and the route-sync
+// tick then moves the route onto the relay once the job is done.
+func TestDeployOfAHibernatingAppProbesTheContainerNotTheRelay(t *testing.T) {
+	for _, state := range []string{"", store.HibernateAwake, store.HibernateSleeping} {
+		t.Run("state="+state, func(t *testing.T) {
+			f := newDeployFixtureIn(t, testStore(t), hibConfig("web", 128, 60, 30))
+			f.attachDomain("web.example.com")
+			if state != "" {
+				if err := f.s.SetHibernateState(f.ctx, f.app.ID, state); err != nil {
+					t.Fatalf("set hibernate state: %v", err)
+				}
+			}
+			fc := &fakeCaddy{}
+			f.dplr.Caddy = fc
+			var probedDial string
+			f.dplr.Probe = func(_ context.Context, host string) (int, error) {
+				probedDial = upstreamDial(t, fc.last(), host)
+				if probedDial == fmt.Sprintf("127.0.0.1:%d", policy.RelayPort) {
+					// What the relay would answer with: the deploy
+					// job owns the app, so final_check would fail.
+					return http.StatusServiceUnavailable, nil
+				}
+				return 200, nil
+			}
+
+			if err := f.run(1, 5); err != nil {
+				t.Fatalf("deploy: %v", err)
+			}
+			dep := f.deployment()
+			if dep.HostPort == nil {
+				t.Fatal("deployment has no host port")
+			}
+			want := fmt.Sprintf("127.0.0.1:%d", *dep.HostPort)
+			if probedDial != want {
+				t.Errorf("final check probed %q, want the new container %q", probedDial, want)
+			}
+
+			// Once the job is done, the route-sync tick converges the
+			// route onto the relay — the assumption the finalize idle
+			// clock restart leans on.
+			if err := RegenerateRoutes(f.ctx, f.s, fc, slog.New(slog.DiscardHandler)); err != nil {
+				t.Fatalf("route sync after deploy: %v", err)
+			}
+			relayDial := fmt.Sprintf("127.0.0.1:%d", policy.RelayPort)
+			if got := upstreamDial(t, fc.last(), "web.example.com"); got != relayDial {
+				t.Errorf("route after sync = %q, want the relay %q", got, relayDial)
+			}
+		})
 	}
 }

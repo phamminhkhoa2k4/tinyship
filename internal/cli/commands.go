@@ -822,6 +822,9 @@ func cmdStatus(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		if a.CurrentDeploymentID != nil {
 			state = "deployment " + shortID(*a.CurrentDeploymentID)
 		}
+		if a.HibernateState != "" {
+			state += ", hibernate=" + a.HibernateState
+		}
 		fmt.Fprintf(stdout, "  %-20s %-30s desired=%s, %s\n", a.Name, ref, a.DesiredState, state)
 	}
 	if rerr != nil {
@@ -842,6 +845,10 @@ type statusApp struct {
 	Tag                 string  `json:"tag"`
 	DesiredState        string  `json:"desired_state"`
 	CurrentDeploymentID *string `json:"current_deployment_id"`
+	// HibernateState is the sleep/wake machine's position ('' when
+	// hibernation is off); the reconcile step needs it so an asleep
+	// app is never reported as needing a deploy.
+	HibernateState string `json:"hibernate_state"`
 }
 
 // fetchStatusApps is the shared /apps read behind status and doctor.
@@ -864,7 +871,10 @@ func statusReconcile(ctx context.Context, apps []statusApp) (reconcile.Report, e
 	}
 	rapps := make([]reconcile.App, len(apps))
 	for i, a := range apps {
-		rapps[i] = reconcile.App{ID: a.ID, Name: a.Name, DesiredState: a.DesiredState}
+		rapps[i] = reconcile.App{
+			ID: a.ID, Name: a.Name, DesiredState: a.DesiredState,
+			HibernateState: a.HibernateState,
+		}
 	}
 	return reconcile.Compare(rapps, running), nil
 }
@@ -933,9 +943,12 @@ func diskFloorWarning(ctx context.Context, c *apiClient) string {
 }
 
 // budgetGrantView is one app's memory grant in the budget response.
+// State is the hibernation position: a sleeping grant is committed but
+// not counted against the awake budget.
 type budgetGrantView struct {
 	Name     string `json:"name"`
 	MemoryMB int    `json:"memory_mb"`
+	State    string `json:"state"`
 }
 
 // budgetView is the API's budget response, plus the local disk reading
@@ -946,6 +959,8 @@ type budgetView struct {
 	BudgetSource  string            `json:"budget_source"`
 	MemTotalMB    int               `json:"mem_total_mb"`
 	CommittedMB   int               `json:"committed_mb"`
+	AwakeMB       int               `json:"awake_mb"`
+	CeilingMB     int               `json:"ceiling_mb"`
 	FreeMB        int               `json:"free_mb"`
 	MinFreeDiskMB int               `json:"min_free_disk_mb"`
 	DiskFreeMB    *int              `json:"disk_free_mb,omitempty"`
@@ -976,6 +991,11 @@ enforces before pulling an image, and how long the disk has before it
 fills on its current trend. The admission guard enforces granted
 limits, not live usage; a deploy that would push the total past the
 budget is refused at the admission step.
+
+Two tiers apply. The awake budget counts apps that are up; a
+hibernating app that is asleep is only counted against the committed
+ceiling (total RAM minus 512 MiB), which is what lets more apps be
+installed than would fit awake at once.
 
 --set-mb N overrides the RAM budget explicitly (0 restores the automatic
 derivation from the host's total RAM).
@@ -1059,8 +1079,11 @@ forecast warning fires (1-90).
 	}
 	fmt.Fprintf(stdout, "Budget     %d MiB (%s of %d MiB RAM)\n",
 		view.BudgetMB, view.BudgetSource, view.MemTotalMB)
+	fmt.Fprintf(stdout, "Awake      %d MiB held by apps that are up\n", view.AwakeMB)
 	fmt.Fprintf(stdout, "Committed  %d MiB across %d running app(s)\n",
 		view.CommittedMB, len(view.Apps))
+	fmt.Fprintf(stdout, "Ceiling    %d MiB (awake or asleep grants together)\n",
+		view.CeilingMB)
 	fmt.Fprintf(stdout, "Free       %d MiB\n", view.FreeMB)
 	fmt.Fprintf(stdout, "Disk floor %d MiB\n", view.MinFreeDiskMB)
 	if view.DiskFreeMB != nil {
@@ -1084,10 +1107,17 @@ forecast warning fires (1-90).
 			view.DiskForecast.SpanHours)
 	}
 	for _, a := range view.Apps {
-		fmt.Fprintf(stdout, "  %-20s %4d MiB\n", a.Name, a.MemoryMB)
+		state := a.State
+		if state == "" {
+			state = "awake"
+		}
+		fmt.Fprintf(stdout, "  %-20s %4d MiB  %s\n", a.Name, a.MemoryMB, state)
 	}
-	if view.FreeMB < 0 {
-		fmt.Fprintln(stdout, "Warning: apps hold more than the budget; new deploys will be refused until grants are lowered or apps are stopped.")
+	if view.AwakeMB > view.BudgetMB {
+		fmt.Fprintln(stdout, "Warning: awake apps exceed the awake RAM budget; deploys and wakes are refused until grants are lowered or apps are stopped.")
+	}
+	if view.CeilingMB > 0 && view.CommittedMB > view.CeilingMB {
+		fmt.Fprintln(stdout, "Warning: committed grants exceed the host ceiling; new deploys will be refused until grants are lowered or apps are deleted.")
 	}
 	if view.DiskFreeMB != nil && *view.DiskFreeMB < view.MinFreeDiskMB {
 		fmt.Fprintln(stdout, "Warning: free disk is below the deploy floor; new deploys will be refused until space is freed.")

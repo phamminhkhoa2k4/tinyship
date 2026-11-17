@@ -77,6 +77,26 @@ func TestMigrateUpgradesV010SchemaWithData(t *testing.T) {
 		t.Errorf("old row = %+v, want intact", st)
 	}
 
+	// The hibernate columns ship with the upgrade: a pre-upgrade row
+	// reads as "no cycles yet" and the state machine accepts a value.
+	if st.HibernateSleepCount != 0 || st.HibernateWakeCount != 0 ||
+		st.HibernateWakeMaxMs != 0 || st.HibernateFlapCount != 0 {
+		t.Errorf("hibernate counters = %+v, want all zero after upgrade", st)
+	}
+	if err := s.SetHibernateState(ctx, appID, HibernateSleeping); err != nil {
+		t.Fatalf("set hibernate state after upgrade: %v", err)
+	}
+	app, err := s.GetAppByID(ctx, appID)
+	if err != nil {
+		t.Fatalf("reload app after upgrade: %v", err)
+	}
+	if app.HibernateState != HibernateSleeping {
+		t.Errorf("hibernate state = %q, want %q", app.HibernateState, HibernateSleeping)
+	}
+	if err := s.SetHibernateState(ctx, appID, HibernateOff); err != nil {
+		t.Fatalf("clear hibernate state: %v", err)
+	}
+
 	if err := s.AppendMetricSample(ctx, MetricSample{
 		AppID: appID, At: time.Now().UTC(), MemBytes: 42 << 20,
 	}); err != nil {

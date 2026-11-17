@@ -40,6 +40,11 @@ const (
 	OomScoreAdj     = 500 // app containers die before system services
 	MinHostPort     = 20000
 	MaxHostPort     = 29999 // loopback-only host port range
+	// RelayPort is where the worker's hibernation wake relay listens.
+	// It takes the top slot of the managed range so proxy routes can
+	// dial it under the same port validation as any app upstream, and
+	// the allocator never hands it to a container.
+	RelayPort = 29999
 )
 
 // PortBinding is a loopback-only host port mapping. The HostIP is always

@@ -266,6 +266,29 @@ func (s *Store) MarkDeploymentRunning(ctx context.Context, id string) error {
 	return nil
 }
 
+// hostPortCandidates lists the managed host-port range in scan order
+// starting at start and wrapping once, without the relay's slot: the
+// wake relay owns that port permanently, so no container may ever be
+// given it, and the caller tries each candidate until one is free.
+func hostPortCandidates(start, minPort, maxPort, relayPort int) []int {
+	if maxPort < minPort {
+		return nil
+	}
+	span := maxPort - minPort + 1
+	if start < minPort || start > maxPort {
+		start = minPort
+	}
+	out := make([]int, 0, span)
+	for i := 0; i < span; i++ {
+		candidate := minPort + (start-minPort+i)%span
+		if candidate == relayPort {
+			continue
+		}
+		out = append(out, candidate)
+	}
+	return out
+}
+
 // AllocateHostPort picks a loopback host port from the managed range
 // that no active deployment holds and records it in one
 // transaction. Returns the existing port if one
@@ -306,11 +329,12 @@ func (s *Store) AllocateHostPort(ctx context.Context, deploymentID string) (int,
 			minPort = 20000 // policy.MinHostPort, duplicated as SQL literal
 			maxPort = 29999 // policy.MaxHostPort
 		)
+		// The wake relay owns this slot; a container must never bind it.
+		const relayPort = 29999 // policy.RelayPort
 		// Deterministic scan from a random start: spreads ports across the
 		// range while still exhausting every candidate before failing.
 		start := minPort + rand.Intn(maxPort-minPort+1)
-		for i := 0; i <= maxPort-minPort; i++ {
-			candidate := minPort + (start-minPort+i)%(maxPort-minPort+1)
+		for _, candidate := range hostPortCandidates(start, minPort, maxPort, relayPort) {
 			if used[candidate] {
 				continue
 			}
@@ -427,6 +451,19 @@ func (s *Store) SucceedDeployment(ctx context.Context, appID, deploymentID strin
 			UPDATE apps SET current_deployment_id = ?, updated_at = ? WHERE id = ?`,
 			deploymentID, time.Now().UTC().UnixMilli(), appID); err != nil {
 			return fmt.Errorf("store: set current deployment: %w", err)
+		}
+		// A succeeded deploy leaves a running container. An app that was
+		// asleep still carries 'sleeping' (or 'waking'), which would make
+		// the sweep skip it and boot reconstruction stop the new
+		// container on the next restart. Move only those two positions:
+		// an app already awake, or with its machine retired, keeps its
+		// state. The relay refuses wakes while a deploy owns the app, so
+		// no other writer can race this inside the transaction.
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE apps SET hibernate_state = ?
+			WHERE id = ? AND hibernate_state IN (?, ?)`,
+			HibernateAwake, appID, HibernateSleeping, HibernateWaking); err != nil {
+			return fmt.Errorf("store: wake deployed app: %w", err)
 		}
 		return nil
 	})

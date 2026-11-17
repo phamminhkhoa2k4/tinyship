@@ -1,10 +1,12 @@
 // Package worker executes jobs claimed from the SQLite queue. It is the only
-// component allowed to touch Docker and the Caddy admin socket. It must
-// never listen on a TCP port.
+// component allowed to touch Docker and the Caddy admin socket. Its one TCP
+// listener is the hibernation wake relay, bound to loopback only, which
+// proxy routes dial directly; every other channel is the Unix log socket.
 //
 // The durable loop (claim → run handler → finish/requeue with a lease
 // heartbeat and a reaper for jobs orphaned by crashes) lives in
-// worker.go; the deploy pipeline lives in deploy.go.
+// worker.go; the deploy pipeline lives in deploy.go; the relay and the
+// sleep/wake machine live in relay.go and hibernate.go.
 package worker
 
 import (
@@ -19,6 +21,7 @@ import (
 
 	"github.com/tinyship/tinyship/internal/caddy"
 	"github.com/tinyship/tinyship/internal/docker"
+	"github.com/tinyship/tinyship/internal/policy"
 	"github.com/tinyship/tinyship/internal/secrypto"
 	"github.com/tinyship/tinyship/internal/store"
 )
@@ -83,6 +86,17 @@ type Config struct {
 	// NotifyInterval is how often the dispatcher looks for due
 	// notification deliveries; default DefaultNotifyInterval.
 	NotifyInterval time.Duration
+	// RelayAddr, when non-empty, is the loopback address the
+	// hibernation wake relay binds (production sets
+	// 127.0.0.1:policy.RelayPort). Empty disables the relay: no wake
+	// path exists, so the sleep sweep must not run either. Run starts
+	// the relay with it and hands the listener over via Relay.
+	RelayAddr string
+	// Relay is the started wake relay Run hands to the loop: the
+	// sleep sweep shares the stats tick with it and the deploy
+	// pipeline restarts idle clocks through it. nil means no wake
+	// path exists, so the sleep sweep must not run.
+	Relay *Relay
 }
 
 // Run starts the worker and blocks until ctx is cancelled. argv is accepted
@@ -99,6 +113,7 @@ func Run(ctx context.Context, argv []string) int {
 		ClaimInterval: time.Second,
 		ReapInterval:  store.ReapEvery,
 		Logger:        logger,
+		RelayAddr:     fmt.Sprintf("127.0.0.1:%d", policy.RelayPort),
 	}
 	// Route-sync period: development and test hosts use it to wait out
 	// a convergence tick instead of the production interval. A value
@@ -152,6 +167,28 @@ func Run(ctx context.Context, argv []string) int {
 		return 1
 	}
 
+	// Wake relay first: hibernating routes dial it, so the state
+	// machine must settle before routes, reconciliation, or any request
+	// can observe it. Reconstruction runs before the listener opens:
+	// routes from before the crash may still point at the relay, and a
+	// request arriving mid-reconstruction could wake an app whose
+	// stale snapshot is about to be stopped. A bind failure leaves
+	// hibernation wakes loudly unavailable while every other app keeps
+	// serving — and with no wake path the sleep sweep must not run
+	// (Relay stays nil).
+	var relay *Relay
+	if cfg.RelayAddr != "" {
+		reconstructHibernate(ctx, s, dw, logger)
+		relay = NewRelay(s, dw, logger)
+		relay.Addr = cfg.RelayAddr
+		if err := relay.Start(ctx); err != nil {
+			logger.Error("worker: wake relay cannot listen; hibernation wakes are unavailable",
+				"addr", cfg.RelayAddr, "err", err)
+			relay = nil
+		}
+	}
+	cfg.Relay = relay
+
 	// Route engine: the deployer talks to the Caddy admin socket, and
 	// regenerating the config from the database at boot and on every
 	// route-sync tick keeps routes reflecting the last succeeded
@@ -159,6 +196,7 @@ func Run(ctx context.Context, argv []string) int {
 	cc := caddy.NewClient(envOr("TINYSHIP_CADDY_ADMIN", caddy.DefaultSocket))
 	dplr := NewDeployer(s, dw, logger, cfg.WorkerID)
 	dplr.Caddy = cc
+	dplr.Relay = relay
 
 	// Sealed secrets need the private key. Absent is fine: public
 	// deploys run without it and secret-bearing ones fail at validate
@@ -235,6 +273,12 @@ func RunStore(ctx context.Context, s *store.Store, cfg Config) error {
 
 	logger.Info("worker: starting",
 		"id", cfg.WorkerID, "db", cfg.DBPath, "handlers", len(cfg.Handlers))
+
+	// The wake relay was started before this loop: hibernating routes
+	// dial it, so it must be listening before routes, reconciliation,
+	// or any request can observe the state machine it serves. nil
+	// means no wake path exists, hence the sleep sweep must not run.
+	relay := cfg.Relay
 
 	// Converge proxy routes to the database before claiming jobs: a
 	// crash during a previous route switch must not leave traffic on a
@@ -346,6 +390,10 @@ func RunStore(ctx context.Context, s *store.Store, cfg Config) error {
 						// A missed sample only delays the next observation.
 						logger.Warn("worker: stats sample failed", "err", err)
 					}
+					// The sleep sweep shares the sampling cadence: idle
+					// timing needs no loop of its own, and one missed
+					// tick only delays a sleep by one interval.
+					hibernateSweep(ctx, relay, logger)
 				}()
 			}
 		case <-notifyTick.C:

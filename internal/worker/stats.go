@@ -39,6 +39,12 @@ type AppStats struct {
 	OOMKillCount int       `json:"oom_kill_count"`
 	SampledAt    time.Time `json:"sampled_at"`
 
+	// Hibernate is the app's sleep/wake position ("" when
+	// hibernation is off): an asleep app has no container to sample,
+	// so the view would otherwise say "missing" about a deliberate
+	// sleep.
+	Hibernate string `json:"hibernate,omitempty"`
+
 	// sampled marks a fresh daemon stats read behind this view, and
 	// memBytes keeps the untruncated reading; both stay unexported so
 	// the socket payload is unchanged.
@@ -131,11 +137,18 @@ func (s *StatsSampler) Sample(ctx context.Context) ([]AppStats, error) {
 		st := AppStats{
 			AppID: app.ID, Name: app.Name, State: "missing", SampledAt: now,
 			MemLimitMB: appMemLimitMB(app.ConfigJSON),
+			Hibernate:  app.HibernateState,
 		}
 		prev := previous[app.ID]
 		if prev != nil {
 			st.OOMKillCount = prev.OOMKillCount
 			st.MemUsageMB = prev.MemUsageMB
+		}
+		if app.HibernateState == store.HibernateSleeping {
+			// The container is stopped on purpose: it holds no
+			// memory, and last sample's usage must not keep warning
+			// about an app that is deliberately asleep.
+			st.MemUsageMB = 0
 		}
 		out[i] = st
 		if info, ok := byApp[app.ID]; ok {

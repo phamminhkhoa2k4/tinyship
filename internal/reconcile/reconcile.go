@@ -20,6 +20,10 @@ type Report struct {
 	// Stopped is intentionally not running (stopped by config or
 	// being deleted); its absence is not drift.
 	Stopped []string `json:"stopped"`
+	// Hibernating wants to run but its container is asleep (or a wake
+	// is in flight); the sleep is deliberate, so its absence is not
+	// drift and the next request brings it back.
+	Hibernating []string `json:"hibernating"`
 	// UnknownRunning lists container ids (not app names: there is no
 	// database row to carry one) of running managed containers the
 	// database does not know about.
@@ -34,11 +38,14 @@ func (r Report) Drift() bool {
 }
 
 // App is the slice of application state the comparison reads.
+// HibernateState is the sleep/wake machine's position: ” means
+// hibernation is off (the app must be running like any other).
 type App struct {
-	ID           string
-	Name         string
-	DesiredState string
-	Deleting     bool
+	ID             string
+	Name           string
+	DesiredState   string
+	Deleting       bool
+	HibernateState string
 }
 
 // FromStore maps database rows to the comparison's view.
@@ -46,10 +53,11 @@ func FromStore(apps []*store.App) []App {
 	out := make([]App, len(apps))
 	for i, a := range apps {
 		out[i] = App{
-			ID:           a.ID,
-			Name:         a.Name,
-			DesiredState: a.DesiredState,
-			Deleting:     a.Deleting,
+			ID:             a.ID,
+			Name:           a.Name,
+			DesiredState:   a.DesiredState,
+			Deleting:       a.Deleting,
+			HibernateState: a.HibernateState,
 		}
 	}
 	return out
@@ -67,6 +75,11 @@ func Compare(apps []App, running map[string]bool) Report {
 			r.Stopped = append(r.Stopped, app.Name)
 		case running[app.ID]:
 			r.UpToDate = append(r.UpToDate, app.Name)
+		case app.HibernateState == store.HibernateSleeping ||
+			app.HibernateState == store.HibernateWaking:
+			// Asleep on purpose: the wake relay, not a deploy, is
+			// what brings the container back.
+			r.Hibernating = append(r.Hibernating, app.Name)
 		default:
 			r.NeedDeploy = append(r.NeedDeploy, app.Name)
 		}
@@ -81,6 +94,7 @@ func Compare(apps []App, running map[string]bool) Report {
 	sort.Strings(r.UpToDate)
 	sort.Strings(r.NeedDeploy)
 	sort.Strings(r.Stopped)
+	sort.Strings(r.Hibernating)
 	sort.Strings(r.UnknownRunning)
 	return r
 }

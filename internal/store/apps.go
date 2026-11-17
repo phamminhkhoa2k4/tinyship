@@ -13,11 +13,23 @@ import (
 // name.
 var ErrAppNameExists = errors.New("E_VALIDATION: app name already exists")
 
+// Hibernate state values recorded in apps.hibernate_state. The empty
+// value means hibernation is off for the app: such an app is always
+// counted awake by admission.
+const (
+	HibernateOff      = ""
+	HibernateAwake    = "awake"
+	HibernateSleeping = "sleeping"
+	HibernateWaking   = "waking"
+)
+
 // ErrNotFound is returned by lookups that expect a row (apps, deployments).
 var ErrNotFound = errors.New("not found")
 
 // App is a row of the apps table. ConfigJSON is the validated,
-// strict-schema app config as of ConfigVersion.
+// strict-schema app config as of ConfigVersion. HibernateState is the
+// sleep/wake machine's position: ” (off, always counted awake),
+// 'awake', 'sleeping', or 'waking'.
 type App struct {
 	ID                  string
 	Name                string
@@ -27,6 +39,7 @@ type App struct {
 	CurrentDeploymentID *string
 	RegistryCredential  *string
 	Deleting            bool
+	HibernateState      string
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
 }
@@ -68,6 +81,29 @@ func (s *Store) UpdateAppConfig(ctx context.Context, appID, configJSON string) e
 		configJSON, time.Now().UTC().UnixMilli(), appID)
 	if err != nil {
 		return fmt.Errorf("store: update app config: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// hibernateStates are the sleep/wake machine's legal values; the empty
+// value clears it (hibernation off for the app).
+var hibernateStates = map[string]bool{"": true, "awake": true, "sleeping": true, "waking": true}
+
+// SetHibernateState records the app's sleep/wake position. The empty
+// value clears it; anything outside the set is rejected so a caller
+// typo cannot strand the machine. updated_at is left alone: a state
+// flip is runtime state, not a config change.
+func (s *Store) SetHibernateState(ctx context.Context, appID, state string) error {
+	if !hibernateStates[state] {
+		return fmt.Errorf("store: invalid hibernate state %q", state)
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE apps SET hibernate_state = ? WHERE id = ?`, state, appID)
+	if err != nil {
+		return fmt.Errorf("store: set hibernate state: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
@@ -134,7 +170,7 @@ func (s *Store) GetAppByID(ctx context.Context, id string) (*App, error) {
 	return s.scanApp(s.db.QueryRowContext(ctx, `
 		SELECT id, name, config_json, config_version, desired_state,
 		       current_deployment_id, registry_credential_id, deleting,
-		       created_at, updated_at
+		       hibernate_state, created_at, updated_at
 		FROM apps WHERE id = ?`, id))
 }
 
@@ -143,7 +179,7 @@ func (s *Store) GetAppByName(ctx context.Context, name string) (*App, error) {
 	return s.scanApp(s.db.QueryRowContext(ctx, `
 		SELECT id, name, config_json, config_version, desired_state,
 		       current_deployment_id, registry_credential_id, deleting,
-		       created_at, updated_at
+		       hibernate_state, created_at, updated_at
 		FROM apps WHERE name = ?`, name))
 }
 
@@ -152,7 +188,7 @@ func (s *Store) ListApps(ctx context.Context) ([]*App, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, name, config_json, config_version, desired_state,
 		       current_deployment_id, registry_credential_id, deleting,
-		       created_at, updated_at
+		       hibernate_state, created_at, updated_at
 		FROM apps ORDER BY name`)
 	if err != nil {
 		return nil, fmt.Errorf("store: list apps: %w", err)
@@ -192,7 +228,7 @@ func scanAppRow(row scannable) (*App, error) {
 	)
 	err := row.Scan(&a.ID, &a.Name, &a.ConfigJSON, &a.ConfigVersion,
 		&a.DesiredState, &currentDDL, &credDDL, &deleting,
-		&createdMS, &updatedMS)
+		&a.HibernateState, &createdMS, &updatedMS)
 	if err != nil {
 		return nil, err
 	}

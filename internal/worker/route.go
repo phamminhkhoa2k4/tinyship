@@ -13,7 +13,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tinyship/tinyship/internal/appconfig"
 	"github.com/tinyship/tinyship/internal/caddy"
+	"github.com/tinyship/tinyship/internal/policy"
 	"github.com/tinyship/tinyship/internal/store"
 )
 
@@ -39,6 +41,53 @@ type Caddy interface {
 // ProbeFunc checks one hostname through the proxy and returns the HTTP
 // status it observed.
 type ProbeFunc func(ctx context.Context, hostname string) (int, error)
+
+// relayTargets returns the app ids whose routes must dial the wake
+// relay: routes of a hibernation-enabled app stay pointed at the relay
+// permanently, so sleeping and waking never need proxy reconfiguration
+// (the decision recorded in the wake-mechanism ADR). An app whose
+// machine is still armed keeps the relay even if hibernation was
+// turned off afterwards — dropping the route would strand a sleeping
+// container with no wake path. A config that no longer parses reads as
+// off: deploy validation owns refusing it, and one unreadable row must
+// not break everyone's routes.
+func relayTargets(ctx context.Context, s *store.Store) (map[string]bool, error) {
+	apps, err := s.ListApps(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]bool{}
+	for _, a := range apps {
+		if a.HibernateState != store.HibernateOff {
+			out[a.ID] = true
+			continue
+		}
+		cfg, err := appconfig.Parse([]byte(a.ConfigJSON))
+		if err != nil {
+			continue
+		}
+		if cfg.HibernateEnabled() {
+			out[a.ID] = true
+		}
+	}
+	return out, nil
+}
+
+// withRelay rewrites the hibernating apps' upstreams to the relay
+// port. Rows are copied: callers own the slice they passed in.
+func withRelay(rows []store.RouteRow, targets map[string]bool) []store.RouteRow {
+	if len(targets) == 0 {
+		return rows
+	}
+	out := make([]store.RouteRow, len(rows))
+	copy(out, rows)
+	for i := range out {
+		if targets[out[i].AppID] {
+			out[i].HostPort = policy.RelayPort
+		}
+	}
+	return out
+}
 
 // DefaultProbeAddr is where the final check reaches the proxy on an
 // installed host. TINYSHIP_CADDY_PROBE overrides it for development and
@@ -110,6 +159,11 @@ func RegenerateRoutes(ctx context.Context, s *store.Store, cc Caddy, log *slog.L
 	if err != nil {
 		return err
 	}
+	targets, err := relayTargets(ctx, s)
+	if err != nil {
+		return err
+	}
+	rows = withRelay(rows, targets)
 	applied, err := s.GetSetting(ctx, CaddyConfigHashKey)
 	if err != nil {
 		return err
@@ -178,6 +232,11 @@ func buildOptions(ov *caddy.Override) caddy.BuildOptions {
 // does not know yet (the new container during route_switch); nil means
 // the database as-is.
 func (p *Deployer) applyServer(ctx context.Context, rows []store.RouteRow, ov *caddy.Override) (string, error) {
+	targets, err := relayTargets(ctx, p.Store)
+	if err != nil {
+		return "", &RetryableError{err}
+	}
+	rows = withRelay(rows, targets)
 	server, err := caddy.BuildServer(rows, buildOptions(ov))
 	if err != nil {
 		return "", &pipelineError{code: "E_CADDY_APPLY", err: err}

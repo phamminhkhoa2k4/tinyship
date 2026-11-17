@@ -363,3 +363,79 @@ func TestAdmissionCPUOvercommitWarns(t *testing.T) {
 		t.Errorf("state = %q, want succeeded: CPU overcommit only warns", d.State)
 	}
 }
+
+// --- hibernation tiers --------------------------------------------------------
+
+func TestAdmissionDoesNotCountSleepingAppsAgainstTheAwakeTier(t *testing.T) {
+	f := newDeployFixtureIn(t, testStore(t), memConfig("web", 256))
+	if err := f.s.SetBudgetMB(f.ctx, 256); err != nil {
+		t.Fatalf("set budget: %v", err)
+	}
+	f.dplr.MemTotalMB = func() (int, error) { return 4096, nil }
+	// api is asleep holding an equal grant: committed keeps it, the
+	// awake tier does not, so web still fits exactly.
+	api := newDeployFixtureIn(t, f.s, memConfig("api", 256))
+	if err := f.s.SetHibernateState(f.ctx, api.app.ID, store.HibernateSleeping); err != nil {
+		t.Fatalf("sleep api: %v", err)
+	}
+
+	if err := f.run(1, 1); err != nil {
+		t.Fatalf("deploy while api sleeps: %v", err)
+	}
+	d := f.deployment()
+	if d.State != "succeeded" {
+		t.Fatalf("state = %q, want succeeded", d.State)
+	}
+	detail := f.admissionDetail()
+	if detail["awake_mb"].(float64) != 0 {
+		t.Errorf("awake_mb = %v, want 0 (api is asleep)", detail["awake_mb"])
+	}
+	if detail["committed_mb"].(float64) != 256 {
+		t.Errorf("committed_mb = %v, want 256 (api's grant still counts)", detail["committed_mb"])
+	}
+	if detail["ceiling_mb"].(float64) != 3584 {
+		t.Errorf("ceiling_mb = %v, want 3584", detail["ceiling_mb"])
+	}
+}
+
+func TestAdmissionRefusesWhenCommittedWouldPassTheCeiling(t *testing.T) {
+	f := newDeployFixtureIn(t, testStore(t), memConfig("web", 300))
+	// The awake tier is generous; the ceiling is what binds: the host
+	// has 1024 MiB, so every grant together may reach 512.
+	f.dplr.MemTotalMB = func() (int, error) { return 1024, nil }
+	if err := f.s.SetBudgetMB(f.ctx, 2048); err != nil {
+		t.Fatalf("set budget: %v", err)
+	}
+	api := newDeployFixtureIn(t, f.s, memConfig("api", 256))
+	if err := f.s.SetHibernateState(f.ctx, api.app.ID, store.HibernateSleeping); err != nil {
+		t.Fatalf("sleep api: %v", err)
+	}
+
+	err := f.run(1, 1)
+	if err == nil || !strings.Contains(err.Error(), "E_BUDGET_EXCEEDED") {
+		t.Fatalf("deploy past the ceiling: err = %v, want E_BUDGET_EXCEEDED", err)
+	}
+	if err != nil && !strings.Contains(err.Error(), "committed ceiling") {
+		t.Errorf("failure must name the tier that refused: %v", err)
+	}
+	d := f.deployment()
+	if d.State != "failed" || d.FailureCode == nil || *d.FailureCode != "E_BUDGET_EXCEEDED" {
+		t.Fatalf("deployment = %q code %v, want failed at admission", d.State, d.FailureCode)
+	}
+	if f.fk.pulls != 0 {
+		t.Errorf("pulls = %d, want 0: a refused deploy must not pull", f.fk.pulls)
+	}
+
+	// Lowering the sleeping app's grant returns the ceiling to range.
+	if _, err := f.s.DB().Exec(
+		`UPDATE apps SET config_json = ? WHERE name = 'api'`, memConfig("api", 64)); err != nil {
+		t.Fatalf("lower api grant: %v", err)
+	}
+	f.queueRedeploy(memConfig("web", 300), false)
+	if err := f.run(1, 1); err != nil {
+		t.Fatalf("deploy after the grant was lowered: %v", err)
+	}
+	if d := f.deployment(); d.State != "succeeded" {
+		t.Errorf("state = %q, want succeeded once the ceiling fits", d.State)
+	}
+}

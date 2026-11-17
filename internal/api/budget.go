@@ -16,9 +16,12 @@ import (
 )
 
 // budgetGrant is one running app's memory grant in the budget view.
+// State is the hibernation machine's position (” reads as awake) so
+// an operator can see which grants the awake tier is not counting.
 type budgetGrant struct {
 	Name     string `json:"name"`
 	MemoryMB int    `json:"memory_mb"`
+	State    string `json:"state"`
 }
 
 // diskForecastView is the days-until-full estimate for the budget
@@ -42,6 +45,8 @@ type budgetView struct {
 	BudgetSource  string           `json:"budget_source"` // configured | auto
 	MemTotalMB    int              `json:"mem_total_mb"`
 	CommittedMB   int              `json:"committed_mb"`
+	AwakeMB       int              `json:"awake_mb"`
+	CeilingMB     int              `json:"ceiling_mb"`
 	FreeMB        int              `json:"free_mb"`
 	MinFreeDiskMB int              `json:"min_free_disk_mb"`
 	CPUOvercommit float64          `json:"cpu_overcommit"`
@@ -85,8 +90,19 @@ func buildBudgetView(ctx context.Context, s *store.Store) (*budgetView, error) {
 			mb = cfg.Resources.MemoryMB
 		}
 		view.CommittedMB += mb
-		view.Apps = append(view.Apps, budgetGrant{Name: a.Name, MemoryMB: mb})
+		state := a.HibernateState
+		if state == "" {
+			// Hibernation off occupies the awake tier, same as an
+			// app that hibernates but is currently up.
+			state = "awake"
+		}
+		if state != store.HibernateSleeping {
+			view.AwakeMB += mb
+		}
+		view.Apps = append(view.Apps,
+			budgetGrant{Name: a.Name, MemoryMB: mb, State: state})
 	}
+	view.CeilingMB = worker.CeilingMB(memTotal)
 	view.FreeMB = budget - view.CommittedMB
 
 	// Disk fill forecast from the worker's hourly samples; the same

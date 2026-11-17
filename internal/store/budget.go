@@ -152,7 +152,7 @@ func (s *Store) ListRunningApps(ctx context.Context) ([]*App, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, name, config_json, config_version, desired_state,
 		       current_deployment_id, registry_credential_id, deleting,
-		       created_at, updated_at
+		       hibernate_state, created_at, updated_at
 		FROM apps
 		WHERE desired_state = 'running' AND deleting = 0
 		ORDER BY name`)

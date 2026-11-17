@@ -91,3 +91,51 @@ func TestFromStoreKeepsTheComparisonFields(t *testing.T) {
 		t.Errorf("FromStore = %+v, want %+v", got, want)
 	}
 }
+
+func TestDriftIgnoresHibernatingApps(t *testing.T) {
+	// Asleep on purpose: no container is the expected state, so the
+	// absence must never be reported as drift.
+	sleeping := Compare([]App{{
+		ID: "a1", Name: "web", DesiredState: "running",
+		HibernateState: store.HibernateSleeping,
+	}}, map[string]bool{})
+	if sleeping.Drift() {
+		t.Error("a sleeping app must not count as drift")
+	}
+	if !reflect.DeepEqual(sleeping.Hibernating, []string{"web"}) {
+		t.Errorf("hibernating = %v, want [web]", sleeping.Hibernating)
+	}
+
+	// A wake in flight is equally deliberate: the relay is bringing
+	// the container up right now.
+	waking := Compare([]App{{
+		ID: "a1", Name: "web", DesiredState: "running",
+		HibernateState: store.HibernateWaking,
+	}}, map[string]bool{})
+	if waking.Drift() {
+		t.Error("an app mid-wake must not count as drift")
+	}
+
+	// Hibernation off means the app must be up: same claim as before.
+	off := Compare([]App{{
+		ID: "a1", Name: "web", DesiredState: "running",
+	}}, map[string]bool{})
+	if !off.Drift() {
+		t.Error("an app without hibernation and without a container is drift")
+	}
+}
+
+func TestFromStoreCarriesHibernateState(t *testing.T) {
+	rows := []*store.App{
+		{ID: "a1", Name: "web", DesiredState: "running",
+			HibernateState: store.HibernateSleeping, ConfigJSON: "{}"},
+		{ID: "a2", Name: "api", DesiredState: "running", ConfigJSON: "{}"},
+	}
+	got := FromStore(rows)
+	if got[0].HibernateState != store.HibernateSleeping {
+		t.Errorf("state = %q, want %q", got[0].HibernateState, store.HibernateSleeping)
+	}
+	if got[1].HibernateState != "" {
+		t.Errorf("state = %q, want empty for an app without hibernation", got[1].HibernateState)
+	}
+}

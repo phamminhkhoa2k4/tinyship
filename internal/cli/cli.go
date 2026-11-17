@@ -86,7 +86,7 @@ func RunWithIO(ctx context.Context, args []string, stdout, stderr io.Writer) int
 // dispatch surfaces valid subcommands rather than one opaque error).
 func dispatchApp(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "tinyship app: subcommand required: create, list, show, or delete")
+		fmt.Fprintln(stderr, "tinyship app: subcommand required: create, list, show, hibernate, or delete")
 		usageApp(stderr)
 		return 2
 	}
@@ -97,6 +97,8 @@ func dispatchApp(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		return cmdAppList(ctx, args[1:], stdout, stderr)
 	case "show", "get":
 		return cmdAppShow(ctx, args[1:], stdout, stderr)
+	case "hibernate":
+		return cmdAppHibernate(ctx, args[1:], stdout, stderr)
 	case "delete", "rm":
 		return cmdAppDelete(ctx, args[1:], stdout, stderr)
 	case "help", "--help", "-h":
@@ -155,11 +157,14 @@ func usageApp(w io.Writer) {
   tinyship app create -f config.json
   tinyship app list [--json]
   tinyship app show <name> [--json]
+  tinyship app hibernate <name> [--on|--off] [--json]
   tinyship app delete <name> --yes
 
 App names and images are immutable; redeploying applies config
-changes. Deleting an app stops and removes its container and routes;
-named volumes keep their data. Run 'tinyship app create --help' for all flags.
+changes. The hibernate toggle is the exception: it applies on the
+worker's next pass, with no redeploy. Deleting an app stops and
+removes its container and routes; named volumes keep their data. Run
+'tinyship app create --help' for all flags.
 `)
 }
 

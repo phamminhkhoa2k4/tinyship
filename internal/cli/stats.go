@@ -26,6 +26,10 @@ type appStatsView struct {
 	NearLimit    bool      `json:"near_limit"`
 	OOMKillCount int       `json:"oom_kill_count"`
 	SampledAt    time.Time `json:"sampled_at"`
+	// Hibernate is the sleep/wake position ("" when hibernation is
+	// off); a sleeping app's container is gone by design, so the
+	// table shows this instead of the container state.
+	Hibernate string `json:"hibernate,omitempty"`
 }
 
 func cmdStats(ctx context.Context, args []string, stdout, stderr io.Writer) int {
@@ -34,7 +38,8 @@ func cmdStats(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 Show each app's last resource sample: memory against its configured
 limit, CPU relative to one core, whether memory use is at or above 80%
 of the limit, and how many times the kernel killed the container for
-exceeding memory.
+exceeding memory. A hibernating app shows sleeping or waking in STATE
+and reports 0 MiB while its container is stopped.
 
 Without an app name, every app is listed.
 `)
@@ -106,8 +111,14 @@ Without an app name, every app is listed.
 		if a.NearLimit {
 			near = "yes"
 		}
+		state := a.State
+		if a.Hibernate == "sleeping" || a.Hibernate == "waking" {
+			// The container is absent because the app is asleep on
+			// purpose; the machine's state is the useful answer.
+			state = a.Hibernate
+		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%.1f%%\t%s\t%d\t%s\n",
-			a.Name, a.State, limit, a.CPUPercent, near, a.OOMKillCount,
+			a.Name, state, limit, a.CPUPercent, near, a.OOMKillCount,
 			a.SampledAt.Local().Format("15:04:05"))
 	}
 	if err := w.Flush(); err != nil {

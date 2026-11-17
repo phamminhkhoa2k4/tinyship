@@ -448,3 +448,87 @@ func TestParseRejectsUnknownMetricsField(t *testing.T) {
 		t.Fatalf("unknown metrics field = %v, want error naming it", err)
 	}
 }
+
+// --- hibernate -------------------------------------------------------
+
+func TestHibernateAbsentReadsAsOff(t *testing.T) {
+	c, err := Parse([]byte(`{"name":"web","image":"nginx","port":8080}`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	// Configs written before the field existed must read as documented:
+	// hibernation off, the 10 minute idle window, the 30 s wake budget.
+	if c.HibernateEnabled() {
+		t.Error("absent hibernate.enabled reads as on, want off")
+	}
+	if c.HibernateIdleTimeout() != time.Duration(DefaultHibernateIdleTimeoutS)*time.Second {
+		t.Errorf("idle = %v, want %ds", c.HibernateIdleTimeout(), DefaultHibernateIdleTimeoutS)
+	}
+	if c.HibernateWakeTimeout() != time.Duration(DefaultHibernateWakeTimeoutS)*time.Second {
+		t.Errorf("wake = %v, want %ds", c.HibernateWakeTimeout(), DefaultHibernateWakeTimeoutS)
+	}
+
+	on, err := Parse([]byte(
+		`{"name":"web","image":"nginx","port":8080,"hibernate":{"enabled":true}}`))
+	if err != nil {
+		t.Fatalf("parse explicit on: %v", err)
+	}
+	if !on.HibernateEnabled() {
+		t.Error("explicit true reads as off, want on")
+	}
+}
+
+func TestValidateHibernateDefaultsAndRanges(t *testing.T) {
+	c := validConfig()
+	if _, err := Validate(c); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if c.Hibernate.IdleTimeoutS != DefaultHibernateIdleTimeoutS ||
+		c.Hibernate.WakeTimeoutS != DefaultHibernateWakeTimeoutS {
+		t.Errorf("defaults = %+v, want %ds/%ds", c.Hibernate,
+			DefaultHibernateIdleTimeoutS, DefaultHibernateWakeTimeoutS)
+	}
+
+	// An explicit off survives validation.
+	c = validConfig()
+	off := false
+	c.Hibernate.Enabled = &off
+	if _, err := Validate(c); err != nil {
+		t.Fatalf("Validate off: %v", err)
+	}
+	if c.Hibernate.Enabled == nil || *c.Hibernate.Enabled {
+		t.Errorf("explicit off = %v, want false", c.Hibernate.Enabled)
+	}
+
+	c = validConfig()
+	c.Hibernate.IdleTimeoutS = MinHibernateIdleTimeoutS - 1
+	if _, err := Validate(c); err == nil || !strings.Contains(err.Error(), "hibernate.idle_timeout_s") {
+		t.Errorf("idle below min = %v", err)
+	}
+	c = validConfig()
+	c.Hibernate.IdleTimeoutS = MaxHibernateIdleTimeoutS + 1
+	if _, err := Validate(c); err == nil || !strings.Contains(err.Error(), "hibernate.idle_timeout_s") {
+		t.Errorf("idle above max = %v", err)
+	}
+	c = validConfig()
+	c.Hibernate.WakeTimeoutS = MinHibernateWakeTimeoutS - 1
+	if _, err := Validate(c); err == nil || !strings.Contains(err.Error(), "hibernate.wake_timeout_s") {
+		t.Errorf("wake below min = %v", err)
+	}
+	c = validConfig()
+	c.Hibernate.WakeTimeoutS = MaxHibernateWakeTimeoutS + 1
+	if _, err := Validate(c); err == nil || !strings.Contains(err.Error(), "hibernate.wake_timeout_s") {
+		t.Errorf("wake above max = %v", err)
+	}
+}
+
+func TestParseRejectsUnknownHibernateField(t *testing.T) {
+	raw := []byte(`{"name":"web","image":"nginx","port":80,"hibernate":{"enabled":True}}`)
+	if _, err := Parse(raw); err == nil {
+		t.Fatal("unknown hibernate value must be rejected")
+	}
+	raw = []byte(`{"name":"web","image":"nginx","port":80,"hibernate":{"idle_time_s":600}}`)
+	if _, err := Parse(raw); err == nil || !strings.Contains(err.Error(), "idle_time_s") {
+		t.Fatalf("unknown hibernate field = %v, want error naming it", err)
+	}
+}
