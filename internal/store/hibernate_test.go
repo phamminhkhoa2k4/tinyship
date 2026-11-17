@@ -189,3 +189,22 @@ func TestHostPortCandidatesNeverOfferTheRelaySlot(t *testing.T) {
 		t.Errorf("exhausted range = %v, want none", got)
 	}
 }
+
+func TestRecordHibernateWakeSubMillisecondIsTimed(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	appID := createApp(t, s, "fast")
+
+	if err := s.RecordHibernateWake(ctx, appID, 250*time.Microsecond,
+		time.Now().UTC()); err != nil {
+		t.Fatalf("record sub-millisecond wake: %v", err)
+	}
+	st, err := s.GetContainerState(ctx, appID)
+	if err != nil {
+		t.Fatalf("get state: %v", err)
+	}
+	if st.HibernateWakeCount != 1 || st.HibernateWakeTotalMs != 1 || st.HibernateWakeMaxMs != 1 {
+		t.Errorf("wake counters = %d/%d/%dms, want 1/1/1ms",
+			st.HibernateWakeCount, st.HibernateWakeTotalMs, st.HibernateWakeMaxMs)
+	}
+}

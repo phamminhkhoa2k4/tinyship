@@ -194,6 +194,11 @@ func (s *Store) RecordHibernateWake(ctx context.Context, appID string, duration 
 	ms := duration.Milliseconds()
 	if ms < 0 {
 		ms = 0
+	} else if ms == 0 && duration > 0 {
+		// A finished wake always took time. Truncating a sub-millisecond
+		// one to 0 would make the stats view show a wake with no timing
+		// at all; keep the coarsest honest value instead.
+		ms = 1
 	}
 	ts := now.UTC().UnixMilli()
 	return s.WithTx(ctx, func(tx *sql.Tx) error {
